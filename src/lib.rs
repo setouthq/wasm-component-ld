@@ -1,9 +1,10 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{ArgAction, CommandFactory, FromArgMatches};
 use clap_lex::OsStrExt;
 use lexopt::Arg;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::str::FromStr;
@@ -243,6 +244,84 @@ struct App {
     lld_args: Vec<OsString>,
 }
 
+/// An invocation of the inner LLD linker that `wasm-component-ld` normally
+/// spawns as a child process.
+pub struct LldInvocation<'a> {
+    exe: &'a Path,
+    needs_flavor: bool,
+    verbose: bool,
+    output: Option<&'a Path>,
+    args: &'a [&'a OsString],
+}
+
+impl LldInvocation<'_> {
+    pub fn argv(&self) -> Vec<OsString> {
+        let mut argv = Vec::new();
+        argv.push(self.exe.as_os_str().to_owned());
+        if self.needs_flavor {
+            argv.push("-flavor".into());
+            argv.push("wasm".into());
+        }
+        argv.extend(self.args.iter().map(|arg| (*arg).clone()));
+        if self.verbose {
+            argv.push("--verbose".into());
+        }
+        if let Some(output) = &self.output {
+            argv.push("-o".into());
+            argv.push(output.as_os_str().to_owned());
+        }
+        argv
+    }
+
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(self.exe);
+        if self.needs_flavor {
+            cmd.arg("-flavor").arg("wasm");
+        }
+        cmd.args(self.args);
+        if self.verbose {
+            cmd.arg("--verbose");
+        }
+        if let Some(output) = &self.output {
+            cmd.arg("-o").arg(output);
+        }
+        cmd
+    }
+}
+
+pub enum LldStatus {
+    Process(ExitStatus),
+    Code(i32),
+}
+
+impl LldStatus {
+    pub fn from_code(code: i32) -> Self {
+        Self::Code(code)
+    }
+
+    fn success(&self) -> bool {
+        match self {
+            Self::Process(status) => status.success(),
+            Self::Code(code) => *code == 0,
+        }
+    }
+}
+
+impl From<ExitStatus> for LldStatus {
+    fn from(status: ExitStatus) -> Self {
+        Self::Process(status)
+    }
+}
+
+impl fmt::Display for LldStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Process(status) => status.fmt(f),
+            Self::Code(code) => write!(f, "exit status: {code}"),
+        }
+    }
+}
+
 /// A linker to create a Component from input object files and libraries.
 ///
 /// This application is an equivalent of `wasm-ld` except that it produces a
@@ -417,6 +496,13 @@ fn run() -> Result<()> {
     App::parse()?.run()
 }
 
+pub fn run_from_args_with_lld<F>(args: impl IntoIterator<Item = OsString>, run_lld: F) -> Result<()>
+where
+    F: for<'a> FnMut(LldInvocation<'a>) -> Result<LldStatus>,
+{
+    App::parse_from(args)?.run_with_lld(run_lld)
+}
+
 impl App {
     /// Parse the CLI arguments into an `App` to run the linker.
     ///
@@ -438,7 +524,15 @@ impl App {
     /// in fact `lexopt` is used to filter out `wasm-ld` arguments and `clap`
     /// only parses arguments specific to `wasm-component-ld`.
     fn parse() -> Result<App> {
-        let mut args = argfile::expand().context("failed to expand @-response files")?;
+        App::parse_from(std::env::args_os())
+    }
+
+    fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<App> {
+        let mut args = argfile::expand_from(args).context("failed to expand @-response files")?;
+        let argv0 = args
+            .first()
+            .cloned()
+            .unwrap_or_else(|| OsString::from("wasm-component-ld"));
 
         // First remove `-flavor wasm` in case this is invoked as a generic LLD
         // driver. We can safely ignore that going forward.
@@ -451,7 +545,7 @@ impl App {
 
         let mut command = ComponentLdArgs::command();
         let mut lld_args = Vec::new();
-        let mut component_ld_args = vec![std::env::args_os().nth(0).unwrap()];
+        let mut component_ld_args = vec![argv0];
         let mut parser = lexopt::Parser::from_iter(args);
 
         fn handle_lld_arg(
@@ -590,6 +684,22 @@ impl App {
     }
 
     fn run(&mut self) -> Result<()> {
+        self.run_with_lld_status(|lld, temp_dir, lld_flags| {
+            lld.status(temp_dir, lld_flags).map(LldStatus::from)
+        })
+    }
+
+    fn run_with_lld<F>(&mut self, mut run_lld: F) -> Result<()>
+    where
+        F: for<'a> FnMut(LldInvocation<'a>) -> Result<LldStatus>,
+    {
+        self.run_with_lld_status(|lld, _temp_dir, lld_flags| run_lld(lld.invocation(lld_flags)))
+    }
+
+    fn run_with_lld_status<F>(&mut self, mut run_lld: F) -> Result<()>
+    where
+        F: for<'a> FnMut(&'a Lld, &'a tempfile::TempDir, &'a [&'a OsString]) -> Result<LldStatus>,
+    {
         let mut lld = self.lld();
 
         // If a temporary output is needed make sure it has the same file name
@@ -623,8 +733,7 @@ impl App {
             .iter()
             .chain(&self.component.append_lld_flag)
             .collect::<Vec<_>>();
-        let status = lld
-            .status(&temp_dir, &lld_flags)
+        let status = run_lld(&lld, &temp_dir, &lld_flags)
             .with_context(|| format!("failed to spawn {linker:?}"))?;
         if !status.success() {
             bail!("failed to invoke LLD: {status}");
@@ -762,7 +871,7 @@ impl App {
         // Search for the first of `wasm-ld` or `rust-lld` in `$PATH`
         let wasm_ld = format!("wasm-ld{}", env::consts::EXE_SUFFIX);
         let rust_lld = format!("rust-lld{}", env::consts::EXE_SUFFIX);
-        for entry in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
+        for entry in split_path_env(&env::var_os("PATH").unwrap_or_default()) {
             if entry.join(&wasm_ld).is_file() {
                 return Lld::new(wasm_ld);
             }
@@ -777,6 +886,22 @@ impl App {
         // that indicates that `wasm-ld` was attempted to be found but couldn't
         // be found.
         Lld::new("wasm-ld")
+    }
+}
+
+fn split_path_env(path: &OsStr) -> Vec<PathBuf> {
+    #[cfg(target_os = "wasi")]
+    {
+        path.to_string_lossy()
+            .split(':')
+            .filter(|entry| !entry.is_empty())
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    {
+        env::split_paths(path).collect()
     }
 }
 
@@ -802,6 +927,16 @@ impl Lld {
         self.output = Some(dst.into());
     }
 
+    fn invocation<'a>(&'a self, args: &'a [&'a OsString]) -> LldInvocation<'a> {
+        LldInvocation {
+            exe: &self.exe,
+            needs_flavor: self.needs_flavor,
+            verbose: self.verbose,
+            output: self.output.as_deref(),
+            args,
+        }
+    }
+
     fn status(&self, tmpdir: &tempfile::TempDir, args: &[&OsString]) -> Result<ExitStatus> {
         // If we can probably pass `args` natively, try to do so. In some cases
         // though just skip this entirely and go straight to below.
@@ -821,8 +956,8 @@ impl Lld {
         }
 
         // The `args` are too big to be passed via the command line itself so
-        // encode the mall using "posix quoting" into an "argfile". This gets
-        // passed as `@foo` to lld and we also pass `--rsp-quoting=posix` to
+        // encode them using "posix quoting" into an "argfile". This gets
+        // passed as `@foo` to LLD and we also pass `--rsp-quoting=posix` to
         // ensure that LLD always uses posix quoting. That means that we don't
         // have to implement the dual nature of both posix and windows encoding
         // here.
@@ -872,17 +1007,7 @@ impl Lld {
     }
 
     fn run(&self, args: &[&OsString]) -> std::io::Result<ExitStatus> {
-        let mut cmd = Command::new(&self.exe);
-        if self.needs_flavor {
-            cmd.arg("-flavor").arg("wasm");
-        }
-        cmd.args(args);
-        if self.verbose {
-            cmd.arg("--verbose");
-        }
-        if let Some(output) = &self.output {
-            cmd.arg("-o").arg(output);
-        }
+        let mut cmd = self.invocation(args).command();
         if self.verbose {
             eprintln!("running {cmd:?}");
         }
@@ -929,4 +1054,32 @@ fn add_wasm_ld_options(mut command: clap::Command) -> clap::Command {
 fn verify_app() {
     ComponentLdArgs::command().debug_assert();
     add_wasm_ld_options(ComponentLdArgs::command()).debug_assert();
+}
+
+#[test]
+fn run_from_args_with_lld_uses_callback() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let output = temp.path().join("out.wasm");
+    let mut saw_invocation = false;
+
+    run_from_args_with_lld(
+        [
+            OsString::from("wasm-component-ld"),
+            OsString::from("--skip-wit-component"),
+            OsString::from("-o"),
+            output.as_os_str().to_owned(),
+            OsString::from("input.o"),
+        ],
+        |invocation| {
+            let argv = invocation.argv();
+            assert!(argv.iter().any(|arg| arg == "input.o"));
+            assert!(argv.iter().any(|arg| arg == "-o"));
+            assert!(argv.iter().any(|arg| arg == output.as_os_str()));
+            saw_invocation = true;
+            Ok(LldStatus::from_code(0))
+        },
+    )?;
+
+    assert!(saw_invocation);
+    Ok(())
 }

@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use std::ffi::{OsStr, OsString};
 
-pub fn expand() -> Result<Vec<OsString>> {
+pub fn expand_from(args: impl IntoIterator<Item = OsString>) -> Result<Vec<OsString>> {
     let mut expander = Expander::default();
-    for arg in std::env::args_os() {
+    for arg in args {
         expander.push(arg)?;
     }
     Ok(expander.args)
