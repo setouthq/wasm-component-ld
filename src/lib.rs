@@ -802,7 +802,7 @@ impl App {
             )?;
         }
 
-        strip_exportless_component_type_sections(&mut core_module)?;
+        strip_incompatible_component_type_sections(&mut core_module)?;
 
         let mut encoder = wit_component::ComponentEncoder::default()
             .reject_legacy_names(self.component.reject_legacy_names)
@@ -907,7 +907,7 @@ fn split_path_env(path: &OsStr) -> Vec<PathBuf> {
     }
 }
 
-fn strip_exportless_component_type_sections(module: &mut Vec<u8>) -> Result<()> {
+fn strip_incompatible_component_type_sections(module: &mut Vec<u8>) -> Result<()> {
     if module.len() < 8 || &module[..4] != b"\0asm" {
         return Ok(());
     }
@@ -931,7 +931,7 @@ fn strip_exportless_component_type_sections(module: &mut Vec<u8>) -> Result<()> 
 
         let strip = id == 0
             && custom_section_name(&module[pos..payload_end])
-                .map(is_exportless_component_type_section)
+                .map(is_incompatible_component_type_section)
                 .unwrap_or(false);
 
         if !strip {
@@ -951,9 +951,13 @@ fn custom_section_name(payload: &[u8]) -> Option<&str> {
     std::str::from_utf8(payload.get(name_start..name_end)?).ok()
 }
 
-fn is_exportless_component_type_section(name: &str) -> bool {
-    name.starts_with("component-type:wit-bindgen:")
-        && name.contains("-with-all-of-its-exports-removed:encoded world")
+fn is_incompatible_component_type_section(name: &str) -> bool {
+    if !name.starts_with("component-type:wit-bindgen:") {
+        return false;
+    }
+
+    name.contains("-with-all-of-its-exports-removed:encoded world")
+        || name.contains(":rust:wasi:bindings:encoded worldrust-wasi-from-crates-io")
 }
 
 fn read_u32_leb(bytes: &[u8], mut pos: usize) -> Result<(u32, usize)> {
@@ -975,7 +979,7 @@ fn read_u32_leb(bytes: &[u8], mut pos: usize) -> Result<(u32, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_exportless_component_type_sections;
+    use super::strip_incompatible_component_type_sections;
 
     #[test]
     fn strips_exportless_component_type_sections() {
@@ -990,7 +994,7 @@ mod tests {
             ),
         ]);
 
-        strip_exportless_component_type_sections(&mut module).unwrap();
+        strip_incompatible_component_type_sections(&mut module).unwrap();
 
         let text = String::from_utf8_lossy(&module);
         assert!(!text.contains("proxy-with-all-of-its-exports-removed"));
@@ -1001,8 +1005,29 @@ mod tests {
     #[test]
     fn leaves_non_wasm_inputs_alone() {
         let mut bytes = b"not wasm".to_vec();
-        strip_exportless_component_type_sections(&mut bytes).unwrap();
+        strip_incompatible_component_type_sections(&mut bytes).unwrap();
         assert_eq!(bytes, b"not wasm");
+    }
+
+    #[test]
+    fn strips_rust_wasi_bindings_component_type_sections() {
+        let mut module = wasm_with_custom_sections(&[
+            (
+                "component-type:wit-bindgen:0.39.0:rust:wasi:bindings:encoded worldrust-wasi-from-crates-io",
+                b"drop me too",
+            ),
+            (
+                "component-type:wit-bindgen:0.39.0:wasi:cli@0.2.4:command:imports and exports",
+                b"keep me",
+            ),
+        ]);
+
+        strip_incompatible_component_type_sections(&mut module).unwrap();
+
+        let text = String::from_utf8_lossy(&module);
+        assert!(!text.contains("rust:wasi:bindings"));
+        assert!(text.contains("command:imports and exports"));
+        assert!(text.contains("keep me"));
     }
 
     fn wasm_with_custom_sections(sections: &[(&str, &[u8])]) -> Vec<u8> {
