@@ -394,13 +394,16 @@ struct ComponentLdArgs {
     #[clap(long)]
     realloc_via_memory_grow: bool,
 
-    /// WIT file representing additional component type information to use.
+    /// WIT file or directory representing additional component type information to use.
+    ///
+    /// A world can be selected explicitly with `PATH#WORLD`, which is useful
+    /// for WIT packages that define more than one world.
     ///
     /// May be specified more than once.
     ///
     /// See also the `--string-encoding` option.
-    #[clap(long = "component-type", value_name = "WIT_FILE")]
-    component_types: Vec<PathBuf>,
+    #[clap(long = "component-type", value_name = "WIT_PATH")]
+    component_types: Vec<String>,
 
     /// String encoding to use when creating the final component.
     ///
@@ -432,6 +435,15 @@ fn parse_encoding(s: &str) -> Result<StringEncoding> {
         "compact-utf16" => StringEncoding::CompactUTF16,
         _ => bail!("unknown string encoding: {s:?}"),
     })
+}
+
+fn component_type_path_and_world(component_type: &str) -> (PathBuf, Option<String>) {
+    match component_type.rsplit_once('#') {
+        Some((path, world)) if !path.is_empty() && !world.is_empty() => {
+            (PathBuf::from(path), Some(world.to_owned()))
+        }
+        _ => (PathBuf::from(component_type), None),
+    }
 }
 
 fn parse_optionally_name_file(s: &str) -> (&str, &str) {
@@ -773,12 +785,13 @@ impl App {
         if !self.component.component_types.is_empty() {
             let mut merged = None::<(Resolve, WorldId)>;
             for wit_file in &self.component.component_types {
+                let (wit_file, world_name) = component_type_path_and_world(wit_file);
                 let mut resolve = Resolve::default();
                 let (package, _) = resolve
-                    .push_path(wit_file)
+                    .push_path(&wit_file)
                     .with_context(|| format!("unable to add component type {wit_file:?}"))?;
 
-                let world = resolve.select_world(&[package], None)?;
+                let world = resolve.select_world(&[package], world_name.as_deref())?;
 
                 if let Some((merged_resolve, merged_world)) = &mut merged {
                     let world = merged_resolve
@@ -979,7 +992,22 @@ fn read_u32_leb(bytes: &[u8], mut pos: usize) -> Result<(u32, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_incompatible_component_type_sections;
+    use super::{component_type_path_and_world, strip_incompatible_component_type_sections};
+
+    #[test]
+    fn parses_component_type_world_suffix() {
+        let (path, world) = component_type_path_and_world("/wit/wasi-http#client-imports");
+        assert_eq!(path, std::path::PathBuf::from("/wit/wasi-http"));
+        assert_eq!(world.as_deref(), Some("client-imports"));
+
+        let (path, world) = component_type_path_and_world("/wit/devenv-subprocess.wit");
+        assert_eq!(path, std::path::PathBuf::from("/wit/devenv-subprocess.wit"));
+        assert_eq!(world, None);
+
+        let (path, world) = component_type_path_and_world("/wit/http#");
+        assert_eq!(path, std::path::PathBuf::from("/wit/http#"));
+        assert_eq!(world, None);
+    }
 
     #[test]
     fn strips_exportless_component_type_sections() {
