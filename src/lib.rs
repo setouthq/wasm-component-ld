@@ -802,6 +802,8 @@ impl App {
             )?;
         }
 
+        strip_exportless_component_type_sections(&mut core_module)?;
+
         let mut encoder = wit_component::ComponentEncoder::default()
             .reject_legacy_names(self.component.reject_legacy_names)
             .realloc_via_memory_grow(self.component.realloc_via_memory_grow);
@@ -902,6 +904,134 @@ fn split_path_env(path: &OsStr) -> Vec<PathBuf> {
     #[cfg(not(target_os = "wasi"))]
     {
         env::split_paths(path).collect()
+    }
+}
+
+fn strip_exportless_component_type_sections(module: &mut Vec<u8>) -> Result<()> {
+    if module.len() < 8 || &module[..4] != b"\0asm" {
+        return Ok(());
+    }
+
+    let mut pos = 8;
+    let mut out = Vec::with_capacity(module.len());
+    out.extend_from_slice(&module[..8]);
+
+    while pos < module.len() {
+        let section_start = pos;
+        let id = module[pos];
+        pos += 1;
+
+        let (payload_len, next) = read_u32_leb(module, pos)?;
+        pos = next;
+
+        let payload_end = pos
+            .checked_add(payload_len as usize)
+            .filter(|end| *end <= module.len())
+            .context("malformed wasm section length")?;
+
+        let strip = id == 0
+            && custom_section_name(&module[pos..payload_end])
+                .map(is_exportless_component_type_section)
+                .unwrap_or(false);
+
+        if !strip {
+            out.extend_from_slice(&module[section_start..payload_end]);
+        }
+
+        pos = payload_end;
+    }
+
+    *module = out;
+    Ok(())
+}
+
+fn custom_section_name(payload: &[u8]) -> Option<&str> {
+    let (name_len, name_start) = read_u32_leb(payload, 0).ok()?;
+    let name_end = name_start.checked_add(name_len as usize)?;
+    std::str::from_utf8(payload.get(name_start..name_end)?).ok()
+}
+
+fn is_exportless_component_type_section(name: &str) -> bool {
+    name.starts_with("component-type:wit-bindgen:")
+        && name.contains("-with-all-of-its-exports-removed:encoded world")
+}
+
+fn read_u32_leb(bytes: &[u8], mut pos: usize) -> Result<(u32, usize)> {
+    let mut result = 0u32;
+    let mut shift = 0;
+
+    for _ in 0..5 {
+        let byte = *bytes.get(pos).context("truncated u32 LEB128")?;
+        pos += 1;
+        result |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok((result, pos));
+        }
+        shift += 7;
+    }
+
+    bail!("invalid u32 LEB128");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_exportless_component_type_sections;
+
+    #[test]
+    fn strips_exportless_component_type_sections() {
+        let mut module = wasm_with_custom_sections(&[
+            (
+                "component-type:wit-bindgen:0.39.0:wasi:http@0.2.4:proxy-with-all-of-its-exports-removed:encoded worldrust-wasi-from-crates-io-proxy-world",
+                b"drop me",
+            ),
+            (
+                "component-type:wit-bindgen:0.39.0:wasi:cli@0.2.4:command:imports and exports",
+                b"keep me",
+            ),
+        ]);
+
+        strip_exportless_component_type_sections(&mut module).unwrap();
+
+        let text = String::from_utf8_lossy(&module);
+        assert!(!text.contains("proxy-with-all-of-its-exports-removed"));
+        assert!(text.contains("command:imports and exports"));
+        assert!(text.contains("keep me"));
+    }
+
+    #[test]
+    fn leaves_non_wasm_inputs_alone() {
+        let mut bytes = b"not wasm".to_vec();
+        strip_exportless_component_type_sections(&mut bytes).unwrap();
+        assert_eq!(bytes, b"not wasm");
+    }
+
+    fn wasm_with_custom_sections(sections: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut module = b"\0asm\x01\0\0\0".to_vec();
+        for (name, data) in sections {
+            let mut payload = Vec::new();
+            push_leb(name.len() as u32, &mut payload);
+            payload.extend_from_slice(name.as_bytes());
+            payload.extend_from_slice(data);
+
+            module.push(0);
+            push_leb(payload.len() as u32, &mut module);
+            module.extend_from_slice(&payload);
+        }
+        module
+    }
+
+    fn push_leb(mut value: u32, dst: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            dst.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
     }
 }
 
