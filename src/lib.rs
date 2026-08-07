@@ -853,7 +853,10 @@ impl App {
                 .with_context(|| format!("failed to inject adapter {name:?}"))?;
         }
 
-        let component = encoder.encode().context("failed to encode component")?;
+        let component = encoder
+            .encode()
+            .map_err(|err| annotate_missing_export(err, &core_module))
+            .context("failed to encode component")?;
 
         std::fs::write(&self.component.output, &component).context(format!(
             "failed to write output file: {:?}",
@@ -918,6 +921,80 @@ fn split_path_env(path: &OsStr) -> Vec<PathBuf> {
     {
         env::split_paths(path).collect()
     }
+}
+
+/// rust#41: when the encoder fails with wit-component's
+/// `failed to find export of interface `I` function `f`` (a dead end —
+/// it names neither near-miss versions nor the nothing-implements-it
+/// case), rescan the core module's export section, where component
+/// exports carry canonical `interface#function` names, and say which of
+/// the two failure faces this actually is. Any other error passes
+/// through untouched.
+fn annotate_missing_export(err: anyhow::Error, core_module: &[u8]) -> anyhow::Error {
+    let Some((iface, func)) = err
+        .chain()
+        .find_map(|cause| parse_missing_export_error(&cause.to_string()))
+    else {
+        return err;
+    };
+
+    let iface_base = iface.split('@').next().unwrap_or(&iface);
+    let near_misses: Vec<String> = module_export_names(core_module)
+        .into_iter()
+        .filter(|name| {
+            let Some((export_iface, export_func)) = name.rsplit_once('#') else {
+                return false;
+            };
+            export_func == func
+                && export_iface != iface
+                && export_iface.split('@').next() == Some(iface_base)
+        })
+        .collect();
+
+    let hint = if near_misses.is_empty() {
+        format!(
+            "the world declares export `{iface}#{func}` but nothing in the linked \
+             artifact implements it — the implementing code may not be part of this \
+             build (for example a handler living in a binary or module that is not \
+             built, or a bindings export macro that is never invoked)"
+        )
+    } else {
+        format!(
+            "module exports `{}` — version mismatch between the declaring world \
+             (`{iface}`) and the implementing bindings; align the world's wit/deps \
+             pin with the bindings crate's interface version",
+            near_misses.join("`, `")
+        )
+    };
+    err.context(hint)
+}
+
+/// Parse `failed to find export of interface `I` function `f`` into
+/// (I, f). The text is wit-component's (pinned by our lock); if it ever
+/// drifts, this returns `None` and the annotation silently disappears —
+/// the corpus battery leg is what screams then.
+fn parse_missing_export_error(message: &str) -> Option<(String, String)> {
+    let rest = message.strip_prefix("failed to find export of interface `")?;
+    let (iface, rest) = rest.split_once('`')?;
+    let rest = rest.strip_prefix(" function `")?;
+    let (func, _) = rest.split_once('`')?;
+    Some((iface.to_string(), func.to_string()))
+}
+
+/// Names in the core module's export section — component-bound exports
+/// carry the canonical `interface#function` naming scheme.
+fn module_export_names(module: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(module) {
+        if let Ok(Payload::ExportSection(reader)) = payload {
+            for export in reader {
+                if let Ok(export) = export {
+                    names.push(export.name.to_string());
+                }
+            }
+        }
+    }
+    names
 }
 
 fn strip_incompatible_component_type_sections(module: &mut Vec<u8>) -> Result<()> {
@@ -988,6 +1065,106 @@ fn read_u32_leb(bytes: &[u8], mut pos: usize) -> Result<(u32, usize)> {
     }
 
     bail!("invalid u32 LEB128");
+}
+
+#[cfg(test)]
+mod missing_export_annotation_tests {
+    use super::{annotate_missing_export, module_export_names, parse_missing_export_error};
+
+    /// A minimal core module whose export section carries `names` as
+    /// func exports. Indices are dangling — wasmparser's parser (not
+    /// validator) reads names regardless, which is all the rescan needs.
+    fn module_with_exports(names: &[&str]) -> Vec<u8> {
+        let mut m = b"\0asm\x01\0\0\0".to_vec();
+        let mut payload = vec![names.len() as u8];
+        for name in names {
+            payload.push(name.len() as u8);
+            payload.extend_from_slice(name.as_bytes());
+            payload.push(0x00); // export kind: func
+            payload.push(0x00); // func index 0
+        }
+        m.push(7); // export section id
+        m.push(payload.len() as u8);
+        m.extend_from_slice(&payload);
+        m
+    }
+
+    #[test]
+    fn parses_the_wit_component_missing_export_text() {
+        assert_eq!(
+            parse_missing_export_error(
+                "failed to find export of interface `wasi:http/incoming-handler@0.2.9` function `handle`"
+            ),
+            Some((
+                "wasi:http/incoming-handler@0.2.9".to_string(),
+                "handle".to_string()
+            ))
+        );
+        assert_eq!(parse_missing_export_error("module was not valid"), None);
+    }
+
+    #[test]
+    fn export_names_are_read_from_the_export_section() {
+        let m = module_with_exports(&["cabi_realloc", "wasi:http/incoming-handler@0.2.12#handle"]);
+        assert_eq!(
+            module_export_names(&m),
+            vec!["cabi_realloc", "wasi:http/incoming-handler@0.2.12#handle"]
+        );
+    }
+
+    #[test]
+    fn near_miss_version_is_named_as_a_mismatch() {
+        // The rust#41 field shape: world declares @0.2.9, bindings
+        // (wstd 0.5.6 vintage) export @0.2.12.
+        let m = module_with_exports(&["cabi_realloc", "wasi:http/incoming-handler@0.2.12#handle"]);
+        let err = anyhow::anyhow!(
+            "failed to find export of interface `wasi:http/incoming-handler@0.2.9` function `handle`"
+        );
+        let annotated = format!("{:#}", annotate_missing_export(err, &m));
+        assert!(
+            annotated.contains("module exports `wasi:http/incoming-handler@0.2.12#handle`"),
+            "{annotated}"
+        );
+        assert!(annotated.contains("version mismatch"), "{annotated}");
+        assert!(annotated.contains("wit/deps pin"), "{annotated}");
+    }
+
+    #[test]
+    fn no_candidate_at_any_version_names_the_unimplemented_face() {
+        // The sibling defect: the linker line carried only cabi_realloc
+        // (handler impl in a never-built src/main.rs).
+        let m = module_with_exports(&["cabi_realloc"]);
+        let err = anyhow::anyhow!(
+            "failed to find export of interface `wasi:http/incoming-handler@0.2.9` function `handle`"
+        );
+        let annotated = format!("{:#}", annotate_missing_export(err, &m));
+        assert!(
+            annotated.contains("nothing in the linked artifact implements it"),
+            "{annotated}"
+        );
+        assert!(annotated.contains("never invoked"), "{annotated}");
+    }
+
+    #[test]
+    fn a_different_function_at_the_same_interface_is_not_a_near_miss() {
+        let m = module_with_exports(&["wasi:http/incoming-handler@0.2.12#other"]);
+        let err = anyhow::anyhow!(
+            "failed to find export of interface `wasi:http/incoming-handler@0.2.9` function `handle`"
+        );
+        let annotated = format!("{:#}", annotate_missing_export(err, &m));
+        assert!(
+            annotated.contains("nothing in the linked artifact implements it"),
+            "{annotated}"
+        );
+    }
+
+    #[test]
+    fn unrelated_errors_pass_through_untouched() {
+        let m = module_with_exports(&["cabi_realloc"]);
+        let err = anyhow::anyhow!("failed to inject adapter");
+        let annotated = format!("{:#}", annotate_missing_export(err, &m));
+        assert_eq!(annotated, "failed to inject adapter");
+    }
 }
 
 #[cfg(test)]
