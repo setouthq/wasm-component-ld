@@ -1050,13 +1050,43 @@ fn custom_section_name(payload: &[u8]) -> Option<&str> {
     std::str::from_utf8(payload.get(name_start..name_end)?).ok()
 }
 
+/// Whether `name` is one of std's own export-less component-type sections,
+/// which this linker drops before componentizing.
+///
+/// std's bindings crates (wasip2 and wasip3, built with `rustc-dep-of-std`)
+/// end their section names in `-in-libstd`, and the fork std's
+/// devenv-subprocess guest emits the `devenv:subprocess` imports world
+/// bare. Those worlds describe what std may import, not what this program
+/// does: the program's actual imports get their types from std's
+/// `wasi:cli` imports world (kept) and from `--component-type` (the
+/// devenv WIT a session names in `WASM_COMPONENT_TYPE_WIT_PATHS`).
+///
+/// Every other component-type section is kept. A user's own bindings (a
+/// wasi:http client crate such as wasip2, wasip3, wasi or wstd, or the
+/// user's own wit-bindgen world) are the only type information for the
+/// imports they make; dropping them fails the link with "module requires
+/// an import interface named `wasi:http/types@...`".
 fn is_incompatible_component_type_section(name: &str) -> bool {
-    if !name.starts_with("component-type:wit-bindgen:") {
+    let Some(rest) = name.strip_prefix("component-type:wit-bindgen:") else {
         return false;
-    }
+    };
+    let Some((_wit_bindgen_version, world)) = rest.split_once(':') else {
+        return false;
+    };
+    let exportless = world.contains("-with-all-of-its-exports-removed:encoded world");
+    exportless && (world.ends_with("-in-libstd") || is_std_devenv_subprocess_world(world))
+}
 
-    name.contains("-with-all-of-its-exports-removed:encoded world")
-        || name.contains(":rust:wasi:bindings:encoded worldrust-wasi-from-crates-io")
+/// std's devenv-subprocess guest world (library/devenv-subprocess-guest):
+/// `devenv:subprocess@<version>:imports-with-all-of-its-exports-removed:encoded world`,
+/// with no suffix after "encoded world".
+fn is_std_devenv_subprocess_world(world: &str) -> bool {
+    world
+        .strip_prefix("devenv:subprocess@")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(_version, rest)| {
+            rest == "imports-with-all-of-its-exports-removed:encoded world"
+        })
 }
 
 fn read_u32_leb(bytes: &[u8], mut pos: usize) -> Result<(u32, usize)> {
@@ -1195,25 +1225,85 @@ mod tests {
         assert_eq!(world, None);
     }
 
-    #[test]
-    fn strips_exportless_component_type_sections() {
-        let mut module = wasm_with_custom_sections(&[
-            (
-                "component-type:wit-bindgen:0.39.0:wasi:http@0.2.4:proxy-with-all-of-its-exports-removed:encoded worldrust-wasi-from-crates-io-proxy-world",
-                b"drop me",
-            ),
-            (
-                "component-type:wit-bindgen:0.39.0:wasi:cli@0.2.4:command:imports and exports",
-                b"keep me",
-            ),
-        ]);
+    // Section names as the crates spell them: wasip2 1.0.4, wasip3 0.7.0
+    // and 0.9.0 append "-in-libstd" when built as std's dependency
+    // (feature rustc-dep-of-std) and nothing otherwise; wasi 0.14 has one
+    // spelling; std's devenv-subprocess guest emits the devenv:subprocess
+    // world bare.
+    const STD_P2_PROXY: &str = "component-type:wit-bindgen:0.58.0:wasi:http@0.2.12:proxy-with-all-of-its-exports-removed:encoded worldrust-wasip2-1.0.4+wasi-0.2.12-from-crates-io-proxy-world-in-libstd";
+    const STD_P2_COMMAND: &str = "component-type:wit-bindgen:0.58.0:wasi:cli@0.2.12:command-with-all-of-its-exports-removed:encoded worldrust-wasip2-1.0.4+wasi-0.2.12-from-crates-io-command-world-in-libstd";
+    const STD_P3_SERVICE: &str = "component-type:wit-bindgen:0.58.0:wasi:http@0.3.0:service-with-all-of-its-exports-removed:encoded worldrust-wasip3-0.7.0+wasi-0.3.0-from-crates-io-service-world-in-libstd";
+    const STD_P3_COMMAND: &str = "component-type:wit-bindgen:0.58.0:wasi:cli@0.3.0:command-with-all-of-its-exports-removed:encoded worldrust-wasip3-0.7.0+wasi-0.3.0-from-crates-io-command-world-in-libstd";
+    const STD_P2_IMPORTS: &str = "component-type:wit-bindgen:0.58.0:wasi:cli@0.2.12:imports:encoded worldrust-wasip2-1.0.4+wasi-0.2.12-from-crates-io-in-libstd";
+    const STD_DEVENV_SUBPROCESS: &str = "component-type:wit-bindgen:0.58.0:devenv:subprocess@0.4.4:imports-with-all-of-its-exports-removed:encoded world";
+    const USER_P2_PROXY: &str = "component-type:wit-bindgen:0.58.0:wasi:http@0.2.12:proxy-with-all-of-its-exports-removed:encoded worldrust-wasip2-1.0.4+wasi-0.2.12-from-crates-io-proxy-world";
+    const USER_P2_COMMAND: &str = "component-type:wit-bindgen:0.58.0:wasi:cli@0.2.12:command-with-all-of-its-exports-removed:encoded worldrust-wasip2-1.0.4+wasi-0.2.12-from-crates-io-command-world";
+    const USER_P3_SERVICE: &str = "component-type:wit-bindgen:0.62.0:wasi:http@0.3.0:service-with-all-of-its-exports-removed:encoded worldrust-wasip3-0.9.0+wasi-0.3.0-from-crates-io-service-world";
+    const USER_WASI_014_PROXY: &str = "component-type:wit-bindgen:0.39.0:wasi:http@0.2.4:proxy-with-all-of-its-exports-removed:encoded worldrust-wasi-from-crates-io-proxy-world";
+    const USER_WASI_014_BINDINGS: &str = "component-type:wit-bindgen:0.39.0:rust:wasi:bindings:encoded worldrust-wasi-from-crates-io";
+    const USER_OWN_WORLD: &str = "component-type:wit-bindgen:0.62.0:my:app:client-with-all-of-its-exports-removed:encoded world";
 
+    fn kept_after_strip(names: &[&str]) -> Vec<String> {
+        let sections = names
+            .iter()
+            .map(|name| (*name, name.as_bytes()))
+            .collect::<Vec<_>>();
+        let mut module = wasm_with_custom_sections(&sections);
         strip_incompatible_component_type_sections(&mut module).unwrap();
+        custom_section_names(&module)
+    }
 
-        let text = String::from_utf8_lossy(&module);
-        assert!(!text.contains("proxy-with-all-of-its-exports-removed"));
-        assert!(text.contains("command:imports and exports"));
-        assert!(text.contains("keep me"));
+    #[test]
+    fn strips_std_exportless_component_type_sections() {
+        let kept = kept_after_strip(&[
+            STD_P2_PROXY,
+            STD_P2_COMMAND,
+            STD_P3_SERVICE,
+            STD_P3_COMMAND,
+            STD_DEVENV_SUBPROCESS,
+            "component-type:wit-bindgen:0.39.0:wasi:cli@0.2.4:command:imports and exports",
+        ]);
+        assert_eq!(
+            kept,
+            ["component-type:wit-bindgen:0.39.0:wasi:cli@0.2.4:command:imports and exports"]
+        );
+    }
+
+    #[test]
+    fn keeps_std_imports_worlds() {
+        // std's wasi:cli imports world was never stripped: it carries the
+        // types of every wasi import std makes.
+        assert_eq!(kept_after_strip(&[STD_P2_IMPORTS]), [STD_P2_IMPORTS]);
+    }
+
+    #[test]
+    fn keeps_a_users_component_type_sections() {
+        // A user's wasi:http client crate (wasip2, wasip3, wasi 0.14, or its
+        // own wit-bindgen world) carries the only type information for its
+        // wasi:http imports: stripping it fails the link with "module
+        // requires an import interface named `wasi:http/types@...`".
+        let user = [
+            USER_P2_PROXY,
+            USER_P2_COMMAND,
+            USER_P3_SERVICE,
+            USER_WASI_014_PROXY,
+            USER_WASI_014_BINDINGS,
+            USER_OWN_WORLD,
+        ];
+        assert_eq!(kept_after_strip(&user), user);
+    }
+
+    #[test]
+    fn mixed_std_and_user_sections_keep_only_the_users() {
+        let kept = kept_after_strip(&[
+            STD_P3_SERVICE,
+            USER_P3_SERVICE,
+            STD_P2_PROXY,
+            USER_P2_PROXY,
+            STD_DEVENV_SUBPROCESS,
+            STD_P2_IMPORTS,
+        ]);
+        assert_eq!(kept, [USER_P3_SERVICE, USER_P2_PROXY, STD_P2_IMPORTS]);
     }
 
     #[test]
@@ -1223,25 +1313,14 @@ mod tests {
         assert_eq!(bytes, b"not wasm");
     }
 
-    #[test]
-    fn strips_rust_wasi_bindings_component_type_sections() {
-        let mut module = wasm_with_custom_sections(&[
-            (
-                "component-type:wit-bindgen:0.39.0:rust:wasi:bindings:encoded worldrust-wasi-from-crates-io",
-                b"drop me too",
-            ),
-            (
-                "component-type:wit-bindgen:0.39.0:wasi:cli@0.2.4:command:imports and exports",
-                b"keep me",
-            ),
-        ]);
-
-        strip_incompatible_component_type_sections(&mut module).unwrap();
-
-        let text = String::from_utf8_lossy(&module);
-        assert!(!text.contains("rust:wasi:bindings"));
-        assert!(text.contains("command:imports and exports"));
-        assert!(text.contains("keep me"));
+    fn custom_section_names(module: &[u8]) -> Vec<String> {
+        wasmparser::Parser::new(0)
+            .parse_all(module)
+            .filter_map(|payload| match payload.unwrap() {
+                wasmparser::Payload::CustomSection(section) => Some(section.name().to_string()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn wasm_with_custom_sections(sections: &[(&str, &[u8])]) -> Vec<u8> {

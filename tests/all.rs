@@ -340,3 +340,112 @@ fn main() {
     );
     assert_module(&output);
 }
+
+/// Encodes `world` of `wit` as a wit-bindgen component-type section payload.
+fn component_type_payload(wit: &str, world: &str) -> Vec<u8> {
+    let mut resolve = wit_parser::Resolve::default();
+    let package = resolve.push_str("client.wit", wit).unwrap();
+    let world = resolve.select_world(&[package], Some(world)).unwrap();
+    wit_component::metadata::encode(
+        &resolve,
+        world,
+        wit_component::StringEncoding::UTF8,
+        None,
+        false,
+    )
+    .unwrap()
+}
+
+/// A program whose only type information for its `my:client/types` import
+/// is the component-type section `section`, as a wasi:http client crate's
+/// bindings carry theirs.
+fn program_with_component_type_section(section: &str) -> String {
+    let payload = component_type_payload(
+        r#"
+package my:client;
+
+interface types {
+  resource fields;
+}
+
+world client {
+  import types;
+}
+"#,
+        "client",
+    );
+    let bytes = payload
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"
+#[link(wasm_import_module = "my:client/types")]
+extern "C" {{
+    #[link_name = "[resource-drop]fields"]
+    fn drop_fields(handle: i32);
+}}
+
+#[link_section = "{section}"]
+#[used]
+static COMPONENT_TYPE: [u8; {len}] = [{bytes}];
+
+fn main() {{
+    unsafe {{ drop_fields(std::env::args().count() as i32) }}
+}}
+"#,
+        len = payload.len(),
+    )
+}
+
+fn component_import_names(bytes: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::ComponentImportSection(reader) = payload.unwrap() {
+            for import in reader {
+                names.push(import.unwrap().name.name.to_string());
+            }
+        }
+    }
+    names
+}
+
+// The section name wit-bindgen gives a crate's own world with its exports
+// removed (`<world>-with-all-of-its-exports-removed`). A wasi:http client
+// crate (wasip2, wasip3, wstd) names its wasi:http world this way, and it
+// carries the only type information for the crate's wasi:http imports.
+#[test]
+fn keeps_a_users_exportless_component_type_section() {
+    let output = compile(
+        &[],
+        &program_with_component_type_section(
+            "component-type:wit-bindgen:0.62.0:my:client:client-with-all-of-its-exports-removed:encoded worldmy-client-from-crates-io-client-world",
+        ),
+    );
+    assert_component(&output);
+    let imports = component_import_names(&output);
+    assert!(
+        imports.iter().any(|name| name == "my:client/types"),
+        "imports: {imports:?}"
+    );
+}
+
+// std's own bindings (wasip2/wasip3 built as std's dependency) end their
+// section names in `-in-libstd`; those are still stripped, so the same
+// program fails to link when its only type information is spelled as std's.
+#[test]
+fn strips_std_exportless_component_type_section() {
+    let result = Project::new().try_compile(
+        &[],
+        &program_with_component_type_section(
+            "component-type:wit-bindgen:0.62.0:my:client:client-with-all-of-its-exports-removed:encoded worldmy-client-from-crates-io-client-world-in-libstd",
+        ),
+        false,
+    );
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(
+        err.contains("module requires an import interface named `my:client/types`"),
+        "{err}"
+    );
+}
