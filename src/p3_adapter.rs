@@ -13,8 +13,10 @@
 //! so at build time.
 //!
 //! This module finds that case and words the warning. A link is a wasm32-wasip3
-//! link when `--cooperative-threading` reaches `wasm-ld` (rustc passes it only
-//! for wasm32-wasip3) or when the core module imports a `wasi:*@0.3` interface.
+//! link when `--cooperative-threading` reaches `wasm-ld`: rustc and clang pass
+//! it for wasm32-wasip3 only. (A `wasi:*@0.3` import is no sign: a
+//! wasm32-wasip2 program on the devenv std imports `wasi:filesystem@0.3.0`
+//! for `File::lock`, and its preview 1 imports are the adapter's normal use.)
 //! The warning names each preview 1 import and, when the module has a name
 //! section, up to three functions that call it.
 
@@ -31,9 +33,11 @@ const MAX_CALLERS: usize = 3;
 /// The warning for this link, or `None` when it is not a wasm32-wasip3 link
 /// or the core module imports nothing from preview 1.
 pub(crate) fn warning(core_module: &[u8], lld_flags: &[&OsString]) -> Option<String> {
-    let flagged = lld_flags.iter().any(|f| *f == "--cooperative-threading");
+    if !lld_flags.iter().any(|f| *f == "--cooperative-threading") {
+        return None;
+    }
     let scan = scan(core_module);
-    if !(flagged || scan.imports_wasi_0_3) || scan.preview1.is_empty() {
+    if scan.preview1.is_empty() {
         return None;
     }
     let names = scan
@@ -64,8 +68,6 @@ pub(crate) fn warning(core_module: &[u8], lld_flags: &[&OsString]) -> Option<Str
 struct Scan {
     /// preview 1 import name -> names of functions that call it.
     preview1: BTreeMap<String, BTreeSet<String>>,
-    /// The module imports some `wasi:<package>/<interface>@0.3.x`.
-    imports_wasi_0_3: bool,
 }
 
 /// Reads the imports, the calls into preview 1 imports and the function names.
@@ -87,9 +89,6 @@ fn scan(core_module: &[u8]) -> Scan {
             Payload::ImportSection(reader) => {
                 for import in reader.into_imports() {
                     let Ok(import) = import else { break };
-                    if import.module.starts_with("wasi:") && is_wasi_0_3(import.module) {
-                        out.imports_wasi_0_3 = true;
-                    }
                     if let TypeRef::Func(_) | TypeRef::FuncExact(_) = import.ty {
                         if import.module == PREVIEW1 {
                             targets.insert(imported_funcs, import.name.to_string());
@@ -152,13 +151,6 @@ fn scan(core_module: &[u8]) -> Scan {
         }
     }
     out
-}
-
-/// `wasi:cli/environment@0.3.0`, `wasi:io/...@0.3.0-rc-2026-03-15` and the like.
-fn is_wasi_0_3(module: &str) -> bool {
-    module
-        .rsplit_once('@')
-        .is_some_and(|(_, version)| version == "0.3" || version.starts_with("0.3."))
 }
 
 /// A readable name for a symbol from the name section. rustc links with
@@ -401,22 +393,13 @@ mod tests {
     }
 
     #[test]
-    fn a_wasi_0_3_import_marks_a_p3_link_without_the_flag() {
+    fn a_wasi_0_3_import_without_the_flag_is_not_p3() {
+        // A wasm32-wasip2 program on the devenv std imports wasi:filesystem
+        // 0.3.0 for File::lock; its preview 1 imports are the adapter's
+        // normal use there, so the link stays quiet.
         let wasm = wat::parse_str(
             r#"(module
-                 (import "wasi:cli/environment@0.3.0" "get-arguments" (func (param i32)))
-                 (import "wasi_snapshot_preview1" "random_get" (func (param i32 i32) (result i32))))"#,
-        )
-        .unwrap();
-        let w = warning(&wasm, &[]).expect("a warning");
-        assert!(w.contains("import: random_get\n"), "{w}");
-    }
-
-    #[test]
-    fn a_wasi_0_2_import_alone_is_not_p3() {
-        let wasm = wat::parse_str(
-            r#"(module
-                 (import "wasi:cli/environment@0.2.12" "get-arguments" (func (param i32)))
+                 (import "wasi:filesystem/preopens@0.3.0" "get-directories" (func (param i32)))
                  (import "wasi_snapshot_preview1" "random_get" (func (param i32 i32) (result i32))))"#,
         )
         .unwrap();
