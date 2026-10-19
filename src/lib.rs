@@ -13,6 +13,7 @@ use wit_component::StringEncoding;
 use wit_parser::{Resolve, WorldId};
 
 mod argfile;
+mod p3_adapter;
 
 /// Representation of a flag passed to `wasm-ld`
 ///
@@ -514,7 +515,31 @@ fn run() -> Result<()> {
     App::parse()?.run()
 }
 
+/// Prints the link's warnings the way a linker does: `warning: ` before each.
+fn print_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
 pub fn run_from_args_with_lld<F>(args: impl IntoIterator<Item = OsString>, run_lld: F) -> Result<()>
+where
+    F: for<'a> FnMut(LldInvocation<'a>) -> Result<LldStatus>,
+{
+    let warnings = App::parse_from(args)?.run_with_lld(run_lld)?;
+    print_warnings(&warnings);
+    Ok(())
+}
+
+/// fork: like [`run_from_args_with_lld`], but returns the link's warnings
+/// instead of printing them, so a caller that links in-process (rustc on a
+/// WASI host) reports them as it reports a spawned linker's stderr. Each
+/// warning is one message without a `warning: ` prefix; a second line, when
+/// present, starts with `note: `.
+pub fn run_from_args_with_lld_warnings<F>(
+    args: impl IntoIterator<Item = OsString>,
+    run_lld: F,
+) -> Result<Vec<String>>
 where
     F: for<'a> FnMut(LldInvocation<'a>) -> Result<LldStatus>,
 {
@@ -702,19 +727,23 @@ impl App {
     }
 
     fn run(&mut self) -> Result<()> {
-        self.run_with_lld_status(|lld, temp_dir, lld_flags| {
+        let warnings = self.run_with_lld_status(|lld, temp_dir, lld_flags| {
             lld.status(temp_dir, lld_flags).map(LldStatus::from)
-        })
+        })?;
+        print_warnings(&warnings);
+        Ok(())
     }
 
-    fn run_with_lld<F>(&mut self, mut run_lld: F) -> Result<()>
+    fn run_with_lld<F>(&mut self, mut run_lld: F) -> Result<Vec<String>>
     where
         F: for<'a> FnMut(LldInvocation<'a>) -> Result<LldStatus>,
     {
         self.run_with_lld_status(|lld, _temp_dir, lld_flags| run_lld(lld.invocation(lld_flags)))
     }
 
-    fn run_with_lld_status<F>(&mut self, mut run_lld: F) -> Result<()>
+    /// Links, then componentizes; returns the link's warnings (none are
+    /// printed here).
+    fn run_with_lld_status<F>(&mut self, mut run_lld: F) -> Result<Vec<String>>
     where
         F: for<'a> FnMut(&'a Lld, &'a tempfile::TempDir, &'a [&'a OsString]) -> Result<LldStatus>,
     {
@@ -758,7 +787,7 @@ impl App {
         }
 
         if self.skip_wit_component() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let reactor_adapter =
@@ -769,6 +798,21 @@ impl App {
             wasi_preview1_component_adapter_provider::WASI_SNAPSHOT_PREVIEW1_PROXY_ADAPTER;
         let mut core_module = std::fs::read(&temp_output)
             .with_context(|| format!("failed to read {linker:?} output: {temp_output:?}"))?;
+
+        // fork (setouthq/rust#79): a wasm32-wasip3 link that is about to
+        // embed the default wasip1 adapter says so. An adapter the caller
+        // chose (`--wasi-adapter`, or `--adapt wasi_snapshot_preview1=...`)
+        // is not a surprise, so it stays quiet then.
+        let chose_adapter = self.component.wasi_adapter.is_some()
+            || self
+                .component
+                .adapters
+                .iter()
+                .any(|(name, _)| name == p3_adapter::PREVIEW1);
+        let mut warnings = Vec::new();
+        if !chose_adapter {
+            warnings.extend(p3_adapter::warning(&core_module, &lld_flags));
+        }
 
         // Inspect the output module to see if it's a command or reactor.
         let mut exports_start = false;
@@ -872,7 +916,7 @@ impl App {
             self.component.output
         ))?;
 
-        Ok(())
+        Ok(warnings)
     }
 
     fn skip_wit_component(&self) -> bool {
@@ -1529,5 +1573,65 @@ fn run_from_args_with_lld_uses_callback() -> Result<()> {
     )?;
 
     assert!(saw_invocation);
+    Ok(())
+}
+
+#[test]
+fn p3_link_with_preview1_imports_returns_the_adapter_warning() -> Result<()> {
+    // setouthq/rust#79: a wasm32-wasip3 link (`--cooperative-threading`)
+    // whose core module imports `wasi_snapshot_preview1.random_get` embeds
+    // the wasip1 adapter, and the caller hears about it. The fake LLD writes
+    // a ready core module where the real one would write its output.
+    let core = wat::parse_str(
+        r#"(module
+             (import "wasi_snapshot_preview1" "random_get"
+               (func $random_get (param i32 i32) (result i32)))
+             (memory (export "memory") 1)
+             (func $_ZN4wasi13lib_generated10random_get17h0123456789abcdefE
+               (param i32 i32) (result i32)
+               local.get 0 local.get 1 call $random_get)
+             (func (export "_start")
+               i32.const 0 i32.const 8
+               call $_ZN4wasi13lib_generated10random_get17h0123456789abcdefE
+               drop))"#,
+    )?;
+    let link = |extra: &[&str]| -> Result<(Vec<String>, Vec<u8>)> {
+        let temp = tempfile::tempdir()?;
+        let output = temp.path().join("out.wasm");
+        let mut args = vec![
+            OsString::from("wasm-component-ld"),
+            OsString::from("--realloc-via-memory-grow"),
+            OsString::from("-o"),
+            output.as_os_str().to_owned(),
+            OsString::from("input.o"),
+        ];
+        args.extend(extra.iter().map(OsString::from));
+        let warnings = run_from_args_with_lld_warnings(args, |invocation| {
+            let argv = invocation.argv();
+            let o = argv.iter().position(|a| a == "-o").expect("-o");
+            std::fs::write(&argv[o + 1], &core)?;
+            Ok(LldStatus::from_code(0))
+        })?;
+        Ok((warnings, std::fs::read(&output)?))
+    };
+
+    let (warnings, component) = link(&["--cooperative-threading"])?;
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains(
+            "wasi_snapshot_preview1 import: random_get (called from wasi::lib_generated::random_get)"
+        ),
+        "{}",
+        warnings[0]
+    );
+    assert!(wasmparser::Parser::is_component(&component));
+
+    // The same module on a wasip2-shaped link: no warning.
+    let (warnings, _) = link(&[])?;
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    // An adapter the caller chose explicitly: no warning.
+    let (warnings, _) = link(&["--cooperative-threading", "--wasi-adapter=command"])?;
+    assert!(warnings.is_empty(), "{warnings:?}");
     Ok(())
 }
