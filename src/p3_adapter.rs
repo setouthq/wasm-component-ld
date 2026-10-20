@@ -59,8 +59,9 @@ pub(crate) fn warning(core_module: &[u8], lld_flags: &[&OsString]) -> Option<Str
          {PREVIEW1} import{plural}: {names}\n\
          note: the component also imports wasi:*@0.2 interfaces beside wasi:*@0.3.0; \
          it runs on hosts that serve both, but does not fit a WASI 0.3-only world. \
-         Find the crate with `cargo tree -i wasi --target wasm32-wasip3` \
-         (the `wasi` 0.9 to 0.11 crates are preview 1 bindings)"
+         Find the crate with `cargo tree -i wasi@0.11 --target wasm32-wasip3` \
+         (the `wasi` 0.9 to 0.11 crates are preview 1 bindings; for 0.9 or 0.10, \
+         name that version)"
     ))
 }
 
@@ -378,10 +379,14 @@ mod tests {
             "{w}"
         );
         assert!(w.contains("wasi_snapshot_preview1 imports:"), "{w}");
+        // `-i wasi` alone stops with "specification `wasi` is ambiguous" when
+        // the lock also holds a wasi 0.2 binding (wasi 0.14 under getrandom
+        // 0.3.0 to 0.3.3): the hint names the preview 1 version.
         assert!(
-            w.contains("cargo tree -i wasi --target wasm32-wasip3"),
+            w.contains("`cargo tree -i wasi@0.11 --target wasm32-wasip3`"),
             "{w}"
         );
+        assert!(!w.contains("cargo tree -i wasi "), "{w}");
         assert_eq!(w.lines().count(), 2, "{w}");
     }
 
