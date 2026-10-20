@@ -1078,7 +1078,14 @@ fn strip_incompatible_component_type_sections(module: &mut Vec<u8>) -> Result<()
                 .unwrap_or(false);
 
         if !strip {
-            out.extend_from_slice(&module[section_start..payload_end]);
+            match split_component_type_section(id, &module[pos..payload_end]) {
+                Some(sections) => {
+                    for (name, data) in sections {
+                        push_custom_section(&mut out, &name, data);
+                    }
+                }
+                None => out.extend_from_slice(&module[section_start..payload_end]),
+            }
         }
 
         pos = payload_end;
@@ -1089,9 +1096,120 @@ fn strip_incompatible_component_type_sections(module: &mut Vec<u8>) -> Result<()
 }
 
 fn custom_section_name(payload: &[u8]) -> Option<&str> {
+    custom_section_name_and_data(payload).map(|(name, _)| name)
+}
+
+fn custom_section_name_and_data(payload: &[u8]) -> Option<(&str, &[u8])> {
     let (name_len, name_start) = read_u32_leb(payload, 0).ok()?;
     let name_end = name_start.checked_add(name_len as usize)?;
-    std::str::from_utf8(payload.get(name_start..name_end)?).ok()
+    let name = std::str::from_utf8(payload.get(name_start..name_end)?).ok()?;
+    Some((name, &payload[name_end..]))
+}
+
+/// fork: a `component-type` section that holds more than one encoded world,
+/// as one section per distinct world.
+///
+/// wasm-ld concatenates custom sections that share a name, so when two
+/// objects carry the same crate's bindings section the linked module holds
+/// both encodings back to back under one name, and wit-component fails on
+/// it with "expected section, got wasm magic number". Two copies of a crate
+/// get into one link when a binary links rlibs from two cargo builds: the
+/// WASI-hosted rustc links rustc's `wasi` 0.14 crate and its tools' copy.
+/// Fat LTO hides it (merging the modules keeps one copy of identical
+/// `wasm.custom_sections` metadata); thin LTO and no LTO keep one object per
+/// copy. Identical encodings are kept once, under the section's name; a
+/// different encoding under the same name (two versions of a crate whose
+/// section name carries no version) gets its own section, named
+/// `<name>#<n>`, which wit-component merges like any other
+/// `component-type` section.
+///
+/// Returns `None` (keep the section as it is) for any other section, and
+/// for one that holds a single encoding or does not parse as a run of
+/// encodings.
+fn split_component_type_section(id: u8, payload: &[u8]) -> Option<Vec<(String, &[u8])>> {
+    if id != 0 {
+        return None;
+    }
+    let (name, data) = custom_section_name_and_data(payload)?;
+    if !name.starts_with("component-type") {
+        return None;
+    }
+    let mut distinct = Vec::<&[u8]>::new();
+    for encoding in concatenated_binaries(data)? {
+        if !distinct.contains(&encoding) {
+            distinct.push(encoding);
+        }
+    }
+    Some(
+        distinct
+            .into_iter()
+            .enumerate()
+            .map(|(i, data)| match i {
+                0 => (name.to_string(), data),
+                _ => (format!("{name}#{i}"), data),
+            })
+            .collect(),
+    )
+}
+
+/// The wasm binaries `data` holds back to back, when it holds more than one.
+///
+/// A binary has no end marker: it ends where the next one's header stands in
+/// place of a section. No section can start with the header's bytes (a
+/// custom section, id 0, of size 0x61 whose name length, 0x73, overruns it),
+/// so the split is exact. `None` for a single binary or for bytes that are
+/// not a run of binaries with well-formed section framing.
+fn concatenated_binaries(data: &[u8]) -> Option<Vec<&[u8]>> {
+    const MAGIC: &[u8] = b"\0asm";
+    const HEADER_LEN: usize = 8;
+    if data.len() < HEADER_LEN || !data.starts_with(MAGIC) {
+        return None;
+    }
+    let mut binaries = Vec::new();
+    let mut start = 0;
+    let mut pos = HEADER_LEN;
+    while pos < data.len() {
+        if data[pos..].starts_with(MAGIC) {
+            if data.len() - pos < HEADER_LEN {
+                return None;
+            }
+            binaries.push(&data[start..pos]);
+            start = pos;
+            pos += HEADER_LEN;
+            continue;
+        }
+        let (size, next) = read_u32_leb(data, pos + 1).ok()?;
+        pos = next
+            .checked_add(size as usize)
+            .filter(|end| *end <= data.len())?;
+    }
+    if binaries.is_empty() {
+        return None;
+    }
+    binaries.push(&data[start..]);
+    Some(binaries)
+}
+
+fn push_custom_section(out: &mut Vec<u8>, name: &str, data: &[u8]) {
+    let mut payload = Vec::with_capacity(name.len() + data.len() + 5);
+    push_u32_leb(&mut payload, name.len() as u32);
+    payload.extend_from_slice(name.as_bytes());
+    payload.extend_from_slice(data);
+    out.push(0);
+    push_u32_leb(out, payload.len() as u32);
+    out.extend_from_slice(&payload);
+}
+
+fn push_u32_leb(dst: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            dst.push(byte);
+            return;
+        }
+        dst.push(byte | 0x80);
+    }
 }
 
 /// Whether `name` is one of std's own export-less component-type sections,
@@ -1355,6 +1473,118 @@ mod tests {
         let mut bytes = b"not wasm".to_vec();
         strip_incompatible_component_type_sections(&mut bytes).unwrap();
         assert_eq!(bytes, b"not wasm");
+    }
+
+    const DUP_WIT: &str = r#"
+        package my:dup;
+        interface a { ping: func(); }
+        interface b { pong: func(); }
+        world wa { import a; }
+        world wb { import b; }
+    "#;
+
+    /// What wit-bindgen puts in a `component-type` section for `world`.
+    fn encoded_world(world: &str) -> Vec<u8> {
+        let mut resolve = wit_parser::Resolve::default();
+        let package = resolve.push_str("dup.wit", DUP_WIT).unwrap();
+        let world = resolve.select_world(&[package], Some(world)).unwrap();
+        wit_component::metadata::encode(
+            &resolve,
+            world,
+            wit_component::StringEncoding::UTF8,
+            None,
+            false,
+        )
+        .unwrap()
+    }
+
+    /// A core module importing `imports` (module, name) as `() -> ()`
+    /// functions, then one custom section per `(name, data)`.
+    fn module_importing(imports: &[(&str, &str)], sections: &[(&str, &[u8])]) -> Vec<u8> {
+        let imports = imports
+            .iter()
+            .map(|(module, name)| format!("(import \"{module}\" \"{name}\" (func))"))
+            .collect::<String>();
+        let mut module = wat::parse_str(format!("(module {imports})")).unwrap();
+        module.extend_from_slice(&wasm_with_custom_sections(sections)[8..]);
+        module
+    }
+
+    fn componentize(module: &[u8]) -> anyhow::Result<Vec<u8>> {
+        wit_component::ComponentEncoder::default()
+            .module(module)?
+            .encode()
+    }
+
+    // The section wasm-ld writes when two objects carry the wasi crate's
+    // bindings section (rustc's copy of wasi 0.14 and its tools' copy in the
+    // WASI-hosted rustc, linked without fat LTO).
+    #[test]
+    fn one_world_encoded_twice_under_one_name_is_kept_once() {
+        let world = encoded_world("wa");
+        let twice = [world.as_slice(), world.as_slice()].concat();
+        let module = module_importing(&[("my:dup/a", "ping")], &[(USER_WASI_014_PROXY, &twice)]);
+
+        let err = componentize(&module).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("expected section, got wasm magic number"),
+            "{err:?}"
+        );
+
+        let mut fixed = module.clone();
+        strip_incompatible_component_type_sections(&mut fixed).unwrap();
+        assert_eq!(custom_section_names(&fixed), [USER_WASI_014_PROXY]);
+        componentize(&fixed).unwrap();
+    }
+
+    #[test]
+    fn different_worlds_under_one_name_each_get_a_section() {
+        let (wa, wb) = (encoded_world("wa"), encoded_world("wb"));
+        let both = [wa.as_slice(), wb.as_slice(), wa.as_slice()].concat();
+        let module = module_importing(
+            &[("my:dup/a", "ping"), ("my:dup/b", "pong")],
+            &[(USER_WASI_014_PROXY, &both)],
+        );
+        assert!(componentize(&module).is_err());
+
+        let mut fixed = module.clone();
+        strip_incompatible_component_type_sections(&mut fixed).unwrap();
+        assert_eq!(
+            custom_section_names(&fixed),
+            [
+                USER_WASI_014_PROXY.to_string(),
+                format!("{USER_WASI_014_PROXY}#1")
+            ]
+        );
+        let component = componentize(&fixed).unwrap();
+        let imports = wasmparser::Parser::new(0)
+            .parse_all(&component)
+            .filter_map(|payload| match payload.unwrap() {
+                wasmparser::Payload::ComponentImportSection(reader) => Some(reader),
+                _ => None,
+            })
+            .flatten()
+            .map(|import| import.unwrap().name.name.to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            imports,
+            ["my:dup/a".to_string(), "my:dup/b".to_string()].into()
+        );
+    }
+
+    #[test]
+    fn a_single_encoding_and_other_sections_pass_through_unchanged() {
+        let world = encoded_world("wa");
+        let module = module_importing(
+            &[("my:dup/a", "ping")],
+            &[
+                (USER_WASI_014_PROXY, &world),
+                ("producers-like", b"\0asm\x0d\0\x01\0\0asm"),
+            ],
+        );
+        let mut same = module.clone();
+        strip_incompatible_component_type_sections(&mut same).unwrap();
+        assert_eq!(same, module);
     }
 
     fn custom_section_names(module: &[u8]) -> Vec<String> {
