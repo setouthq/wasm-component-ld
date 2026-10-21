@@ -14,6 +14,7 @@ use wit_parser::{Resolve, WorldId};
 
 mod argfile;
 mod p3_adapter;
+mod validate;
 
 /// Representation of a flag passed to `wasm-ld`
 ///
@@ -361,7 +362,9 @@ struct ComponentLdArgs {
 
     /// Whether or not the output component is validated.
     ///
-    /// This defaults to `false`.
+    /// This defaults to `true` (fork: upstream defaults to `false`). Without
+    /// this flag, `SETOUT_WASM_COMPONENT_LD_VALIDATE=0` in the environment
+    /// turns validation off.
     #[clap(long, require_equals = true, value_name = "true|false")]
     validate_component: Option<Option<bool>>,
 
@@ -873,9 +876,6 @@ impl App {
             .reject_legacy_names(self.component.reject_legacy_names)
             .realloc_via_memory_grow(self.component.realloc_via_memory_grow)
             .shim_return_call_ref(self.component.return_call_ref);
-        if let Some(validate) = self.component.validate_component {
-            encoder.validate(validate.unwrap_or(true));
-        }
         if let Some(merge) = self.component.merge_imports_based_on_semver {
             encoder.merge_imports_based_on_semver(merge.unwrap_or(true));
         }
@@ -910,6 +910,16 @@ impl App {
             .encode()
             .map_err(|err| annotate_missing_export(err, &core_module))
             .context("failed to encode component")?;
+
+        // fork: validate what is about to be written (see `validate`); the
+        // encoder's own `validate` option is left off so that a failure
+        // reads as the linker's, with what it found, not as an encode error.
+        if validate::enabled(
+            self.component.validate_component,
+            env::var_os(validate::ENV).as_deref(),
+        ) {
+            validate::check(&component, &self.component.output)?;
+        }
 
         std::fs::write(&self.component.output, &component).context(format!(
             "failed to write output file: {:?}",
@@ -1863,5 +1873,81 @@ fn p3_link_with_preview1_imports_returns_the_adapter_warning() -> Result<()> {
     // An adapter the caller chose explicitly: no warning.
     let (warnings, _) = link(&["--cooperative-threading", "--wasi-adapter=command"])?;
     assert!(warnings.is_empty(), "{warnings:?}");
+    Ok(())
+}
+
+#[test]
+fn an_async_lowered_sync_import_fails_the_link() -> Result<()> {
+    // fork: `g` is a sync WIT function, so lowering it with the `async`
+    // option (an `[async-lower]g` import) makes a component no runtime
+    // loads. wit-component encodes it anyway; the link must fail. The fake
+    // LLD writes a ready core module where the real one would write its
+    // output.
+    let temp = tempfile::tempdir()?;
+    let wit = temp.path().join("api.wit");
+    std::fs::write(
+        &wit,
+        "package test:sync;\ninterface api { g: func(x: u32); }\nworld root { import api; }\n",
+    )?;
+    let core = |import: &str, results: &str| {
+        wat::parse_str(format!(
+            r#"(module
+                 (import "test:sync/api" "{import}" (func (param i32) {results}))
+                 (memory (export "memory") 1))"#
+        ))
+    };
+    let sync_core = core("g", "")?;
+    let async_core = core("[async-lower]g", "(result i32)")?;
+    let link = |core: &[u8], extra: &[&str]| -> Result<Vec<u8>> {
+        let output = temp.path().join("out.wasm");
+        let _ = std::fs::remove_file(&output);
+        let mut args = vec![
+            OsString::from("wasm-component-ld"),
+            OsString::from("--wasi-adapter=none"),
+            OsString::from("--component-type"),
+            wit.as_os_str().to_owned(),
+            OsString::from("-o"),
+            output.as_os_str().to_owned(),
+            OsString::from("input.o"),
+        ];
+        args.extend(extra.iter().map(OsString::from));
+        run_from_args_with_lld(args, |invocation| {
+            let argv = invocation.argv();
+            let o = argv.iter().position(|a| a == "-o").expect("-o");
+            std::fs::write(&argv[o + 1], core)?;
+            Ok(LldStatus::from_code(0))
+        })?;
+        Ok(std::fs::read(&output)?)
+    };
+
+    // By default the invalid component fails the link, nothing is written,
+    // and the error names the problem, the import and the escapes.
+    let err = format!("{:#}", link(&async_core, &[]).unwrap_err());
+    assert!(
+        err.contains("the `async` canonical option requires an async function type"),
+        "{err}"
+    );
+    assert!(
+        err.contains("in the lowering of `test:sync/api#g`"),
+        "{err}"
+    );
+    assert!(err.contains("SETOUT_WASM_COMPONENT_LD_VALIDATE=0"), "{err}");
+    assert!(!temp.path().join("out.wasm").exists());
+
+    // `--validate-component=false` writes it, as upstream does by default.
+    let invalid = link(&async_core, &["--validate-component=false"])?;
+    assert!(wasmparser::Parser::is_component(&invalid));
+    assert!(
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&invalid)
+            .is_err()
+    );
+
+    // A valid link writes the same bytes with or without validation.
+    let validated = link(&sync_core, &[])?;
+    let unvalidated = link(&sync_core, &["--validate-component=false"])?;
+    assert_eq!(validated, unvalidated);
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&validated)?;
     Ok(())
 }

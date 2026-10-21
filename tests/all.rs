@@ -449,3 +449,137 @@ fn strips_std_exportless_component_type_section() {
         "{err}"
     );
 }
+
+/// fork: links `src` (wasm32-wasip1, through this linker) to `out.wasm` in
+/// `project`'s directory with `vars` set for the link, and returns the bytes
+/// or the failure with rustc's stderr.
+fn link_with_env(
+    project: &Project,
+    args: &[&str],
+    src: &str,
+    vars: &[(&str, &str)],
+) -> Result<Vec<u8>> {
+    let myself = env!("CARGO_BIN_EXE_wasm-component-ld");
+    let out = project.tempdir.path().join("out.wasm");
+    let _ = fs::remove_file(&out);
+    let mut rustc = Command::new("rustc");
+    rustc
+        .arg("--target")
+        .arg("wasm32-wasip1")
+        .arg("-")
+        .arg("-o")
+        .arg(&out)
+        .arg("-C")
+        .arg(&format!("linker={myself}"))
+        .args(args)
+        .env_remove("SETOUT_WASM_COMPONENT_LD_VALIDATE")
+        .envs(vars.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .current_dir(project.tempdir.path());
+    let mut child = rustc.spawn().context("failed to spawn rustc")?;
+    child
+        .stdin
+        .take()
+        .context("stdin should be present")?
+        .write_all(src.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!(
+            "subprocess failed: {:?}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(fs::read(&out)?)
+}
+
+#[test]
+fn validation_leaves_a_valid_link_byte_identical() {
+    // fork: the default validation only reads the component, so a valid
+    // link writes the same bytes as with validation off (upstream's
+    // default, here SETOUT_WASM_COMPONENT_LD_VALIDATE=0).
+    let project = Project::new();
+    let src = r#"
+fn main() {
+    println!("hello!");
+}
+"#;
+    let validated = link_with_env(&project, &[], src, &[]).unwrap();
+    let unvalidated = link_with_env(
+        &project,
+        &[],
+        src,
+        &[("SETOUT_WASM_COMPONENT_LD_VALIDATE", "0")],
+    )
+    .unwrap();
+    assert_component(&validated);
+    assert!(validated == unvalidated, "validation changed the output");
+}
+
+const SYNC_API_WIT: &str = r#"
+package test:sync;
+
+interface api {
+  g: func(x: u32);
+}
+
+world root {
+  import api;
+}
+"#;
+
+// `g` is a sync WIT function; importing it as `[async-lower]g` asks for an
+// async lowering, which no runtime accepts.
+const ASYNC_LOWER_OF_SYNC_SRC: &str = r#"
+#[link(wasm_import_module = "test:sync/api")]
+extern "C" {
+    #[link_name = "[async-lower]g"]
+    fn g_async(x: i32) -> i32;
+}
+
+fn main() {
+    unsafe {
+        g_async(1);
+    }
+}
+"#;
+
+#[test]
+fn an_async_lowered_sync_import_fails_at_link_time() {
+    let project = Project::new();
+    project.file("api.wit", SYNC_API_WIT);
+    let args = ["-Clink-arg=--component-type", "-Clink-arg=api.wit"];
+
+    // Default: the link fails and says why, naming the import.
+    let err = link_with_env(&project, &args, ASYNC_LOWER_OF_SYNC_SRC, &[]).unwrap_err();
+    let err = format!("{err:?}");
+    println!("error: {err}");
+    assert!(err.contains("the linked component is invalid"), "{err}");
+    assert!(
+        err.contains("the `async` canonical option requires an async function type"),
+        "{err}"
+    );
+    assert!(
+        err.contains("in the lowering of `test:sync/api#g`"),
+        "{err}"
+    );
+    assert!(!project.tempdir.path().join("out.wasm").exists());
+
+    // The escapes write the (invalid) component, as upstream does.
+    for (extra, vars) in [
+        (None, &[("SETOUT_WASM_COMPONENT_LD_VALIDATE", "0")][..]),
+        (Some("-Clink-arg=--validate-component=false"), &[][..]),
+    ] {
+        let mut args = args.to_vec();
+        args.extend(extra);
+        let bytes = link_with_env(&project, &args, ASYNC_LOWER_OF_SYNC_SRC, vars).unwrap();
+        assert!(wasmparser::Parser::is_component(&bytes));
+        assert!(
+            wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+                .validate_all(&bytes)
+                .is_err()
+        );
+    }
+}
