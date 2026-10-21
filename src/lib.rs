@@ -703,6 +703,18 @@ impl App {
                         if let Some(arg) = command.get_arguments().find(|a| a.get_long() == Some(c))
                         {
                             match arg.get_action() {
+                                // fork: a `--flag[=value]` option (declared
+                                // `require_equals`) takes a value only from
+                                // its own `=`; a bare `--validate-component`
+                                // means `true` and never swallows the next
+                                // argument (on wasm32-wasip3 that is
+                                // `--cooperative-threading`).
+                                ArgAction::Set if arg.is_require_equals_set() => {
+                                    if let Some(value) = parser.optional_value() {
+                                        flag.push("=");
+                                        flag.push(value);
+                                    }
+                                }
                                 ArgAction::Set | ArgAction::Append => {
                                     flag.push("=");
                                     flag.push(parser.value()?);
@@ -1949,5 +1961,40 @@ fn an_async_lowered_sync_import_fails_the_link() -> Result<()> {
     assert_eq!(validated, unvalidated);
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
         .validate_all(&validated)?;
+    Ok(())
+}
+
+#[test]
+fn a_bare_optional_value_flag_does_not_take_the_next_argument() -> Result<()> {
+    // fork: clang passes `--cooperative-threading` right after the user's
+    // `-Wl,` flags on wasm32-wasip3; a bare `--validate-component` used to
+    // take it as its value and stop the link.
+    let app = App::parse_from(
+        [
+            "wasm-component-ld",
+            "--validate-component",
+            "--cooperative-threading",
+            "--merge-imports-based-on-semver",
+            "-o",
+            "out.wasm",
+            "input.o",
+        ]
+        .map(OsString::from),
+    )?;
+    assert_eq!(app.component.validate_component, Some(None));
+    assert_eq!(app.component.merge_imports_based_on_semver, Some(None));
+    assert!(app.lld_args.iter().any(|a| a == "--cooperative-threading"));
+    assert!(app.lld_args.iter().any(|a| a == "input.o"));
+
+    let app = App::parse_from(
+        [
+            "wasm-component-ld",
+            "--validate-component=false",
+            "-o",
+            "out.wasm",
+        ]
+        .map(OsString::from),
+    )?;
+    assert_eq!(app.component.validate_component, Some(Some(false)));
     Ok(())
 }
