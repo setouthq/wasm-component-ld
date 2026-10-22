@@ -246,6 +246,10 @@ const LLD_FLAGS: &[LldFlag] = &[
 struct App {
     component: ComponentLdArgs,
     lld_args: Vec<OsString>,
+    /// fork: `SETOUT_WASM_COMPONENT_LD_VALIDATE` as it was when the
+    /// arguments were parsed (see `validate::enabled`). Read once, with the
+    /// arguments, so that a test can set it without the process environment.
+    validate_env: Option<OsString>,
 }
 
 /// An invocation of the inner LLD linker that `wasm-component-ld` normally
@@ -733,6 +737,7 @@ impl App {
             Ok(matches) => Ok(App {
                 component: ComponentLdArgs::from_arg_matches(&matches)?,
                 lld_args,
+                validate_env: env::var_os(validate::ENV),
             }),
             Err(_) => {
                 add_wasm_ld_options(ComponentLdArgs::command()).get_matches_from(component_ld_args);
@@ -928,7 +933,7 @@ impl App {
         // reads as the linker's, with what it found, not as an encode error.
         if validate::enabled(
             self.component.validate_component,
-            env::var_os(validate::ENV).as_deref(),
+            self.validate_env.as_deref(),
         ) {
             validate::check(&component, &self.component.output)?;
         }
@@ -1894,7 +1899,9 @@ fn an_async_lowered_sync_import_fails_the_link() -> Result<()> {
     // option (an `[async-lower]g` import) makes a component no runtime
     // loads. wit-component encodes it anyway; the link must fail. The fake
     // LLD writes a ready core module where the real one would write its
-    // output.
+    // output. Each link says what SETOUT_WASM_COMPONENT_LD_VALIDATE is (unset
+    // for the default), so the ambient environment of `cargo test` does not
+    // decide the outcome.
     let temp = tempfile::tempdir()?;
     let wit = temp.path().join("api.wit");
     std::fs::write(
@@ -1910,7 +1917,7 @@ fn an_async_lowered_sync_import_fails_the_link() -> Result<()> {
     };
     let sync_core = core("g", "")?;
     let async_core = core("[async-lower]g", "(result i32)")?;
-    let link = |core: &[u8], extra: &[&str]| -> Result<Vec<u8>> {
+    let link = |core: &[u8], extra: &[&str], var: Option<&str>| -> Result<Vec<u8>> {
         let output = temp.path().join("out.wasm");
         let _ = std::fs::remove_file(&output);
         let mut args = vec![
@@ -1923,7 +1930,9 @@ fn an_async_lowered_sync_import_fails_the_link() -> Result<()> {
             OsString::from("input.o"),
         ];
         args.extend(extra.iter().map(OsString::from));
-        run_from_args_with_lld(args, |invocation| {
+        let mut app = App::parse_from(args)?;
+        app.validate_env = var.map(OsString::from);
+        app.run_with_lld(|invocation| {
             let argv = invocation.argv();
             let o = argv.iter().position(|a| a == "-o").expect("-o");
             std::fs::write(&argv[o + 1], core)?;
@@ -1934,7 +1943,7 @@ fn an_async_lowered_sync_import_fails_the_link() -> Result<()> {
 
     // By default the invalid component fails the link, nothing is written,
     // and the error names the problem, the import and the escapes.
-    let err = format!("{:#}", link(&async_core, &[]).unwrap_err());
+    let err = format!("{:#}", link(&async_core, &[], None).unwrap_err());
     assert!(
         err.contains("the `async` canonical option requires an async function type"),
         "{err}"
@@ -1946,18 +1955,34 @@ fn an_async_lowered_sync_import_fails_the_link() -> Result<()> {
     assert!(err.contains("SETOUT_WASM_COMPONENT_LD_VALIDATE=0"), "{err}");
     assert!(!temp.path().join("out.wasm").exists());
 
-    // `--validate-component=false` writes it, as upstream does by default.
-    let invalid = link(&async_core, &["--validate-component=false"])?;
-    assert!(wasmparser::Parser::is_component(&invalid));
-    assert!(
-        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
-            .validate_all(&invalid)
-            .is_err()
-    );
+    // `--validate-component=false` writes it, as upstream does by default,
+    // and so does the environment escape; an explicit flag beats the
+    // environment.
+    for (extra, var) in [
+        (&["--validate-component=false"][..], None),
+        (&[][..], Some("0")),
+        (&["--validate-component=false"][..], Some("1")),
+    ] {
+        let invalid = link(&async_core, extra, var)?;
+        assert!(wasmparser::Parser::is_component(&invalid));
+        assert!(
+            wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+                .validate_all(&invalid)
+                .is_err()
+        );
+    }
+    for (extra, var) in [
+        (&[][..], Some("1")),
+        (&["--validate-component"][..], Some("0")),
+        (&["--validate-component=true"][..], Some("0")),
+    ] {
+        let err = format!("{:#}", link(&async_core, extra, var).unwrap_err());
+        assert!(err.contains("the linked component is invalid"), "{err}");
+    }
 
     // A valid link writes the same bytes with or without validation.
-    let validated = link(&sync_core, &[])?;
-    let unvalidated = link(&sync_core, &["--validate-component=false"])?;
+    let validated = link(&sync_core, &[], None)?;
+    let unvalidated = link(&sync_core, &["--validate-component=false"], None)?;
     assert_eq!(validated, unvalidated);
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
         .validate_all(&validated)?;
