@@ -450,6 +450,89 @@ fn strips_std_exportless_component_type_section() {
     );
 }
 
+/// A program that binds `devenv:subprocess@<version>` itself, as a crate
+/// built on devenv's guest crate (wit-bindgen with `pub_export_macro`)
+/// does: its only type information for the `concurrency` import is the
+/// component-type section `section`.
+fn program_binding_devenv_subprocess(section: &str, version: &str) -> String {
+    let payload = component_type_payload(
+        &format!(
+            r#"
+package devenv:subprocess@{version};
+
+interface concurrency {{
+  hint: func() -> u32;
+}}
+
+world imports {{
+  import concurrency;
+}}
+"#
+        ),
+        "imports",
+    );
+    let bytes = payload
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"
+#[link(wasm_import_module = "devenv:subprocess/concurrency@{version}")]
+extern "C" {{
+    #[link_name = "hint"]
+    fn hint() -> i32;
+}}
+
+#[link_section = "{section}"]
+#[used]
+static COMPONENT_TYPE: [u8; {len}] = [{bytes}];
+
+fn main() {{
+    std::process::exit(unsafe {{ hint() }});
+}}
+"#,
+        len = payload.len(),
+    )
+}
+
+// fork: a crate that binds devenv:subprocess itself names its world the way
+// std's guest did through rust-1.99-b6 (no suffix after "encoded world").
+// Through rust-1.99-b6 this linker dropped every such world, whatever its
+// version, and the link failed for want of the import's types.
+#[test]
+fn keeps_a_users_devenv_subprocess_section_at_any_version() {
+    for version in ["0.4.4", "0.4.6", "0.5.0"] {
+        let section = format!(
+            "component-type:wit-bindgen:0.58.0:devenv:subprocess@{version}:imports-with-all-of-its-exports-removed:encoded world"
+        );
+        let output = compile(&[], &program_binding_devenv_subprocess(&section, version));
+        assert_component(&output);
+        let imports = component_import_names(&output);
+        let want = format!("devenv:subprocess/concurrency@{version}");
+        assert!(imports.contains(&want), "{version}: imports: {imports:?}");
+    }
+}
+
+// fork: std's own copy (library/devenv-subprocess-guest, rustc-dep-of-std)
+// ends its section name in "-in-libstd" and is still dropped.
+#[test]
+fn strips_std_devenv_subprocess_section() {
+    let result = Project::new().try_compile(
+        &[],
+        &program_binding_devenv_subprocess(
+            "component-type:wit-bindgen:0.58.0:devenv:subprocess@0.4.6:imports-with-all-of-its-exports-removed:encoded worldrust-devenv-subprocess-guest-0.4.6-in-libstd",
+            "0.4.6",
+        ),
+        false,
+    );
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(
+        err.contains("module requires an import interface named `devenv:subprocess/concurrency@0.4.6`"),
+        "{err}"
+    );
+}
+
 /// fork: links `src` (wasm32-wasip1, through this linker) to `out.wasm` in
 /// `project`'s directory with `vars` set for the link, and returns the bytes
 /// or the failure with rustc's stderr.

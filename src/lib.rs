@@ -1254,19 +1254,22 @@ fn push_u32_leb(dst: &mut Vec<u8>, mut value: u32) {
 /// Whether `name` is one of std's own export-less component-type sections,
 /// which this linker drops before componentizing.
 ///
-/// std's bindings crates (wasip2 and wasip3, built with `rustc-dep-of-std`)
-/// end their section names in `-in-libstd`, and the fork std's
-/// devenv-subprocess guest emits the `devenv:subprocess` imports world
-/// bare. Those worlds describe what std may import, not what this program
-/// does: the program's actual imports get their types from std's
-/// `wasi:cli` imports world (kept) and from `--component-type` (the
-/// devenv WIT a session names in `WASM_COMPONENT_TYPE_WIT_PATHS`).
+/// std's bindings crates, built with `rustc-dep-of-std`, end their section
+/// names in `-in-libstd`: wasip2 and wasip3, and the fork std's
+/// devenv-subprocess guest (`rust-devenv-subprocess-guest-<version>-in-libstd`
+/// since rust 1.99.1-b1). Those worlds describe what std may import, not
+/// what this program does: the program's actual imports get their types
+/// from std's `wasi:cli` imports world (kept) and from `--component-type`
+/// (the devenv WIT a session names in `WASM_COMPONENT_TYPE_WIT_PATHS`).
 ///
 /// Every other component-type section is kept. A user's own bindings (a
-/// wasi:http client crate such as wasip2, wasip3, wasi or wstd, or the
-/// user's own wit-bindgen world) are the only type information for the
-/// imports they make; dropping them fails the link with "module requires
-/// an import interface named `wasi:http/types@...`".
+/// wasi:http client crate such as wasip2, wasip3, wasi or wstd, a crate
+/// that binds `devenv:subprocess` itself at any version, or the user's own
+/// wit-bindgen world) are the only type information for the imports they
+/// make; dropping them fails the link with "module requires an import
+/// interface named `wasi:http/types@...`". Through rust-1.99-b6 this also
+/// dropped every bare `devenv:subprocess` imports world, the name std's
+/// guest then had, so such a crate lost its types whatever its version.
 fn is_incompatible_component_type_section(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("component-type:wit-bindgen:") else {
         return false;
@@ -1275,19 +1278,7 @@ fn is_incompatible_component_type_section(name: &str) -> bool {
         return false;
     };
     let exportless = world.contains("-with-all-of-its-exports-removed:encoded world");
-    exportless && (world.ends_with("-in-libstd") || is_std_devenv_subprocess_world(world))
-}
-
-/// std's devenv-subprocess guest world (library/devenv-subprocess-guest):
-/// `devenv:subprocess@<version>:imports-with-all-of-its-exports-removed:encoded world`,
-/// with no suffix after "encoded world".
-fn is_std_devenv_subprocess_world(world: &str) -> bool {
-    world
-        .strip_prefix("devenv:subprocess@")
-        .and_then(|rest| rest.split_once(':'))
-        .is_some_and(|(_version, rest)| {
-            rest == "imports-with-all-of-its-exports-removed:encoded world"
-        })
+    exportless && world.ends_with("-in-libstd")
 }
 
 fn read_u32_leb(bytes: &[u8], mut pos: usize) -> Result<(u32, usize)> {
@@ -1427,22 +1418,25 @@ mod tests {
     }
 
     // Section names as the crates spell them: wasip2 1.0.4, wasip3 0.7.0
-    // and 0.9.0 append "-in-libstd" when built as std's dependency
-    // (feature rustc-dep-of-std) and nothing otherwise; wasi 0.14 has one
-    // spelling; std's devenv-subprocess guest emits the devenv:subprocess
-    // world bare.
+    // and 0.9.0, and the fork std's devenv-subprocess guest from rust
+    // 1.99.1-b1, append "-in-libstd" when built as std's dependency (feature
+    // rustc-dep-of-std) and nothing otherwise; wasi 0.14 has one spelling. A
+    // crate that binds devenv:subprocess itself (wit-bindgen with
+    // pub_export_macro, as devenv's guest crate) emits the world bare.
     const STD_P2_PROXY: &str = "component-type:wit-bindgen:0.58.0:wasi:http@0.2.12:proxy-with-all-of-its-exports-removed:encoded worldrust-wasip2-1.0.4+wasi-0.2.12-from-crates-io-proxy-world-in-libstd";
     const STD_P2_COMMAND: &str = "component-type:wit-bindgen:0.58.0:wasi:cli@0.2.12:command-with-all-of-its-exports-removed:encoded worldrust-wasip2-1.0.4+wasi-0.2.12-from-crates-io-command-world-in-libstd";
     const STD_P3_SERVICE: &str = "component-type:wit-bindgen:0.58.0:wasi:http@0.3.0:service-with-all-of-its-exports-removed:encoded worldrust-wasip3-0.7.0+wasi-0.3.0-from-crates-io-service-world-in-libstd";
     const STD_P3_COMMAND: &str = "component-type:wit-bindgen:0.58.0:wasi:cli@0.3.0:command-with-all-of-its-exports-removed:encoded worldrust-wasip3-0.7.0+wasi-0.3.0-from-crates-io-command-world-in-libstd";
     const STD_P2_IMPORTS: &str = "component-type:wit-bindgen:0.58.0:wasi:cli@0.2.12:imports:encoded worldrust-wasip2-1.0.4+wasi-0.2.12-from-crates-io-in-libstd";
-    const STD_DEVENV_SUBPROCESS: &str = "component-type:wit-bindgen:0.58.0:devenv:subprocess@0.4.4:imports-with-all-of-its-exports-removed:encoded world";
+    const STD_DEVENV_SUBPROCESS: &str = "component-type:wit-bindgen:0.58.0:devenv:subprocess@0.4.6:imports-with-all-of-its-exports-removed:encoded worldrust-devenv-subprocess-guest-0.4.6-in-libstd";
     const USER_P2_PROXY: &str = "component-type:wit-bindgen:0.58.0:wasi:http@0.2.12:proxy-with-all-of-its-exports-removed:encoded worldrust-wasip2-1.0.4+wasi-0.2.12-from-crates-io-proxy-world";
     const USER_P2_COMMAND: &str = "component-type:wit-bindgen:0.58.0:wasi:cli@0.2.12:command-with-all-of-its-exports-removed:encoded worldrust-wasip2-1.0.4+wasi-0.2.12-from-crates-io-command-world";
     const USER_P3_SERVICE: &str = "component-type:wit-bindgen:0.62.0:wasi:http@0.3.0:service-with-all-of-its-exports-removed:encoded worldrust-wasip3-0.9.0+wasi-0.3.0-from-crates-io-service-world";
     const USER_WASI_014_PROXY: &str = "component-type:wit-bindgen:0.39.0:wasi:http@0.2.4:proxy-with-all-of-its-exports-removed:encoded worldrust-wasi-from-crates-io-proxy-world";
     const USER_WASI_014_BINDINGS: &str = "component-type:wit-bindgen:0.39.0:rust:wasi:bindings:encoded worldrust-wasi-from-crates-io";
     const USER_OWN_WORLD: &str = "component-type:wit-bindgen:0.62.0:my:app:client-with-all-of-its-exports-removed:encoded world";
+    const USER_DEVENV_SUBPROCESS_044: &str = "component-type:wit-bindgen:0.58.0:devenv:subprocess@0.4.4:imports-with-all-of-its-exports-removed:encoded world";
+    const USER_DEVENV_SUBPROCESS_046: &str = "component-type:wit-bindgen:0.58.0:devenv:subprocess@0.4.6:imports-with-all-of-its-exports-removed:encoded world";
 
     fn kept_after_strip(names: &[&str]) -> Vec<String> {
         let sections = names
@@ -1490,8 +1484,30 @@ mod tests {
             USER_WASI_014_PROXY,
             USER_WASI_014_BINDINGS,
             USER_OWN_WORLD,
+            USER_DEVENV_SUBPROCESS_044,
+            USER_DEVENV_SUBPROCESS_046,
         ];
         assert_eq!(kept_after_strip(&user), user);
+    }
+
+    #[test]
+    fn keeps_a_users_devenv_subprocess_world_at_any_version() {
+        // A crate that binds devenv:subprocess itself, at std's version or
+        // another, keeps its types; only std's own copy goes.
+        let kept = kept_after_strip(&[
+            STD_DEVENV_SUBPROCESS,
+            USER_DEVENV_SUBPROCESS_044,
+            USER_DEVENV_SUBPROCESS_046,
+            "component-type:wit-bindgen:0.62.0:devenv:subprocess@0.5.0:imports-with-all-of-its-exports-removed:encoded world",
+        ]);
+        assert_eq!(
+            kept,
+            [
+                USER_DEVENV_SUBPROCESS_044,
+                USER_DEVENV_SUBPROCESS_046,
+                "component-type:wit-bindgen:0.62.0:devenv:subprocess@0.5.0:imports-with-all-of-its-exports-removed:encoded world",
+            ]
+        );
     }
 
     #[test]
@@ -1502,9 +1518,13 @@ mod tests {
             STD_P2_PROXY,
             USER_P2_PROXY,
             STD_DEVENV_SUBPROCESS,
+            USER_DEVENV_SUBPROCESS_044,
             STD_P2_IMPORTS,
         ]);
-        assert_eq!(kept, [USER_P3_SERVICE, USER_P2_PROXY, STD_P2_IMPORTS]);
+        assert_eq!(
+            kept,
+            [USER_P3_SERVICE, USER_P2_PROXY, USER_DEVENV_SUBPROCESS_044, STD_P2_IMPORTS]
+        );
     }
 
     #[test]
