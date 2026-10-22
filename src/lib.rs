@@ -708,13 +708,25 @@ impl App {
                         {
                             match arg.get_action() {
                                 // fork: a `--flag[=value]` option (declared
-                                // `require_equals`) takes a value only from
-                                // its own `=`; a bare `--validate-component`
-                                // means `true` and never swallows the next
-                                // argument (on wasm32-wasip3 that is
+                                // `require_equals`) takes its value from its
+                                // own `=`, or from the next argument only
+                                // when that is one of its values (`true` or
+                                // `false`, so `--validate-component false`
+                                // still means false). A bare
+                                // `--validate-component` means `true` and
+                                // never swallows anything else (on
+                                // wasm32-wasip3 clang's next argument is
                                 // `--cooperative-threading`).
                                 ArgAction::Set if arg.is_require_equals_set() => {
-                                    if let Some(value) = parser.optional_value() {
+                                    let value = parser.optional_value().or_else(|| {
+                                        let values = arg.get_possible_values();
+                                        parser.try_raw_args()?.next_if(|next| {
+                                            next.to_str().is_some_and(|next| {
+                                                values.iter().any(|v| v.matches(next, false))
+                                            })
+                                        })
+                                    });
+                                    if let Some(value) = value {
                                         flag.push("=");
                                         flag.push(value);
                                     }
@@ -2021,5 +2033,47 @@ fn a_bare_optional_value_flag_does_not_take_the_next_argument() -> Result<()> {
         .map(OsString::from),
     )?;
     assert_eq!(app.component.validate_component, Some(Some(false)));
+    Ok(())
+}
+
+#[test]
+fn an_optional_value_flag_still_takes_a_separate_true_or_false() -> Result<()> {
+    // fork: `--validate-component false` (two arguments, as
+    // `-Wl,--validate-component,false` passes them) meant false before the
+    // bare-flag fix and still does; the next argument is taken only when it
+    // is `true` or `false`, so an input after a bare flag stays an input.
+    let app = App::parse_from(
+        [
+            "wasm-component-ld",
+            "--validate-component",
+            "false",
+            "--merge-imports-based-on-semver",
+            "true",
+            "-o",
+            "out.wasm",
+            "input.o",
+        ]
+        .map(OsString::from),
+    )?;
+    assert_eq!(app.component.validate_component, Some(Some(false)));
+    assert_eq!(
+        app.component.merge_imports_based_on_semver,
+        Some(Some(true))
+    );
+    assert!(!app.lld_args.iter().any(|a| a == "false" || a == "true"));
+    assert!(app.lld_args.iter().any(|a| a == "input.o"));
+
+    let app = App::parse_from(
+        [
+            "wasm-component-ld",
+            "--validate-component",
+            "input.o",
+            "-o",
+            "out.wasm",
+        ]
+        .map(OsString::from),
+    )?;
+    assert_eq!(app.component.validate_component, Some(None));
+    assert!(app.lld_args.iter().any(|a| a == "input.o"));
     Ok(())
 }

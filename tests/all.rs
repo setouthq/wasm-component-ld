@@ -567,10 +567,15 @@ fn an_async_lowered_sync_import_fails_at_link_time() {
     );
     assert!(!project.tempdir.path().join("out.wasm").exists());
 
-    // The escapes write the (invalid) component, as upstream does.
+    // The escapes write the (invalid) component, as upstream does; the
+    // flag's value may also come as the next argument.
     for (extra, vars) in [
-        (None, &[("SETOUT_WASM_COMPONENT_LD_VALIDATE", "0")][..]),
-        (Some("-Clink-arg=--validate-component=false"), &[][..]),
+        (&[][..], &[("SETOUT_WASM_COMPONENT_LD_VALIDATE", "0")][..]),
+        (&["-Clink-arg=--validate-component=false"][..], &[][..]),
+        (
+            &["-Clink-arg=--validate-component", "-Clink-arg=false"][..],
+            &[][..],
+        ),
     ] {
         let mut args = args.to_vec();
         args.extend(extra);
