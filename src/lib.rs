@@ -1523,7 +1523,12 @@ mod tests {
         ]);
         assert_eq!(
             kept,
-            [USER_P3_SERVICE, USER_P2_PROXY, USER_DEVENV_SUBPROCESS_044, STD_P2_IMPORTS]
+            [
+                USER_P3_SERVICE,
+                USER_P2_PROXY,
+                USER_DEVENV_SUBPROCESS_044,
+                STD_P2_IMPORTS
+            ]
         );
     }
 

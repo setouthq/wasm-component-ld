@@ -528,7 +528,9 @@ fn strips_std_devenv_subprocess_section() {
     );
     let err = format!("{:?}", result.unwrap_err());
     assert!(
-        err.contains("module requires an import interface named `devenv:subprocess/concurrency@0.4.6`"),
+        err.contains(
+            "module requires an import interface named `devenv:subprocess/concurrency@0.4.6`"
+        ),
         "{err}"
     );
 }
