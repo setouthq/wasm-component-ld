@@ -507,6 +507,11 @@ pub fn main() {
         Ok(()) => return,
         Err(e) => e,
     };
+    // fork: a command line that does not parse (and `--help`, `--version`)
+    // prints and exits the way clap's `get_matches_from` did here.
+    if let Some(usage) = err.downcast_ref::<UsageError>() {
+        usage.0.exit();
+    }
     eprintln!("error: {err}");
     if err.chain().len() > 1 {
         eprintln!("\nCaused by:");
@@ -521,6 +526,50 @@ pub fn main() {
 fn run() -> Result<()> {
     App::parse()?.run()
 }
+
+/// fork: the command line did not parse: clap's usage error, or `--help`
+/// or `--version`, which clap reports the same way. Upstream printed it and
+/// called `process::exit` from inside the parse, which ends an in-process
+/// caller too: clang's driver in a WASI C toolchain (the link job runs in
+/// the driver's process, so the driver never printed "linker command
+/// failed" or removed its temporary files) and rustc linking in process on
+/// WASI. Now the parse returns it. [`main`] prints it and exits with its
+/// code, as before; [`run_from_args_with_lld`] and
+/// [`run_from_args_with_lld_warnings`] return it inside their error, and a
+/// caller finds it with `downcast_ref::<UsageError>()` to print it and
+/// end the link with its exit code, the way a spawned wasm-component-ld
+/// does. Its `Display` is clap's text without the leading `error: `.
+#[derive(Debug)]
+pub struct UsageError(clap::Error);
+
+impl UsageError {
+    /// The text wasm-component-ld prints for it, without color: the error
+    /// with its usage line, or the help or version text.
+    pub fn rendered(&self) -> String {
+        self.0.render().to_string()
+    }
+
+    /// wasm-component-ld's exit status for it: 2 for a usage error, 0 for
+    /// `--help` and `--version`.
+    pub fn exit_code(&self) -> i32 {
+        self.0.exit_code()
+    }
+
+    /// Whether wasm-component-ld prints it on stderr (a usage error) or on
+    /// stdout (`--help`, `--version`).
+    pub fn use_stderr(&self) -> bool {
+        self.0.use_stderr()
+    }
+}
+
+impl fmt::Display for UsageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = self.rendered();
+        f.write_str(text.strip_prefix("error: ").unwrap_or(&text).trim_end())
+    }
+}
+
+impl std::error::Error for UsageError {}
 
 /// Prints the link's warnings the way a linker does: `warning: ` before each.
 fn print_warnings(warnings: &[String]) {
@@ -751,9 +800,16 @@ impl App {
                 lld_args,
                 validate_env: env::var_os(validate::ENV),
             }),
-            Err(_) => {
-                add_wasm_ld_options(ComponentLdArgs::command()).get_matches_from(component_ld_args);
-                unreachable!();
+            // fork: clap's error comes back ([`UsageError`]) instead of
+            // exiting the process. The command with wasm-ld's options added
+            // renders it (so `--help` lists them, as upstream's did); the
+            // first parse's error stands if that one parses.
+            Err(first) => {
+                let err = add_wasm_ld_options(ComponentLdArgs::command())
+                    .try_get_matches_from(component_ld_args)
+                    .err()
+                    .unwrap_or(first);
+                Err(UsageError(err).into())
             }
         }
     }
@@ -784,9 +840,18 @@ impl App {
         // If a temporary output is needed make sure it has the same file name
         // as the output of our command itself since LLD will embed this file
         // name in the name section of the output.
+        // fork: a temporary directory that cannot be made names where and
+        // for which output (tempfile's own error can name an empty path,
+        // as `-o nodir/x.wasm` with no `nodir` gave on WASI).
         let temp_dir = match self.component.output.parent() {
-            Some(parent) => tempfile::TempDir::new_in(parent)?,
-            None => tempfile::TempDir::new()?,
+            Some(parent) => tempfile::TempDir::new_in(parent).with_context(|| {
+                let dir = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+                format!(
+                    "failed to create a temporary directory in {dir:?}, the directory of the output {:?}",
+                    self.component.output
+                )
+            })?,
+            None => tempfile::TempDir::new().context("failed to create a temporary directory")?,
         };
         let temp_output = match self.component.output.file_name() {
             Some(name) => temp_dir.path().join(name),
@@ -1395,6 +1460,68 @@ mod missing_export_annotation_tests {
         let err = anyhow::anyhow!("failed to inject adapter");
         let annotated = format!("{:#}", annotate_missing_export(err, &m));
         assert_eq!(annotated, "failed to inject adapter");
+    }
+}
+
+#[cfg(test)]
+mod usage_error_tests {
+    use super::{LldStatus, UsageError, run_from_args_with_lld_warnings};
+    use std::ffi::OsString;
+
+    fn link(args: &[&str]) -> anyhow::Result<Vec<String>> {
+        run_from_args_with_lld_warnings(args.iter().map(OsString::from), |_| {
+            panic!("the line did not parse: wasm-ld must not run")
+        })
+    }
+
+    /// fork: an argument wasm-component-ld does not take comes back as a
+    /// [`UsageError`] (it used to print and exit the process): exit code
+    /// 2, on stderr, clap's text.
+    #[test]
+    fn an_unknown_argument_is_a_usage_error_not_an_exit() {
+        let err = link(&["wasm-component-ld", "--bogus-flag", "x.o", "-o", "x.wasm"]).unwrap_err();
+        let usage = err.downcast_ref::<UsageError>().expect("a UsageError");
+        assert_eq!(usage.exit_code(), 2);
+        assert!(usage.use_stderr());
+        let rendered = usage.rendered();
+        assert!(rendered.starts_with("error: unexpected argument '--bogus-flag' found"), "{rendered}");
+        assert!(rendered.contains("Usage: wasm-component-ld"), "{rendered}");
+        let shown = err.to_string();
+        assert!(shown.starts_with("unexpected argument '--bogus-flag' found"), "{shown}");
+        assert!(!shown.ends_with('\n'), "{shown:?}");
+    }
+
+    /// `--help` and `--version` come back the same way, for stdout, exit
+    /// code 0; the help lists wasm-ld's options, as upstream's did.
+    #[test]
+    fn help_and_version_are_usage_errors_for_stdout() {
+        let err = link(&["wasm-component-ld", "--help"]).unwrap_err();
+        let usage = err.downcast_ref::<UsageError>().expect("a UsageError");
+        assert_eq!(usage.exit_code(), 0);
+        assert!(!usage.use_stderr());
+        assert!(usage.rendered().contains("forwarded to `wasm-ld`"), "{}", usage.rendered());
+        let err = link(&["wasm-component-ld", "--version"]).unwrap_err();
+        let usage = err.downcast_ref::<UsageError>().expect("a UsageError");
+        assert_eq!(usage.exit_code(), 0);
+        assert!(usage.rendered().starts_with("wasm-component-ld "), "{}", usage.rendered());
+    }
+
+    /// An output in a directory that does not exist names the directory
+    /// and the output; wasm-ld never runs.
+    #[test]
+    fn a_missing_output_directory_is_named() {
+        let dir = std::env::temp_dir().join(format!("wcld-usage-{}", std::process::id()));
+        let out = dir.join("missing").join("x.wasm");
+        let err = run_from_args_with_lld_warnings(
+            ["wasm-component-ld", "x.o", "-o", out.to_str().unwrap()].map(OsString::from),
+            |_| -> anyhow::Result<LldStatus> { panic!("no temporary directory: wasm-ld must not run") },
+        )
+        .unwrap_err();
+        let shown = err.to_string();
+        assert!(shown.contains("failed to create a temporary directory in"), "{shown}");
+        assert!(shown.contains(&format!("{:?}", dir.join("missing"))), "{shown}");
+        assert!(shown.contains(&format!("{out:?}")), "{shown}");
+        assert!(err.downcast_ref::<UsageError>().is_none());
     }
 }
 
