@@ -841,14 +841,17 @@ impl App {
         // as the output of our command itself since LLD will embed this file
         // name in the name section of the output.
         // fork: a temporary directory that cannot be made names where and
-        // for which output (tempfile's own error can name an empty path,
-        // as `-o nodir/x.wasm` with no `nodir` gave on WASI).
+        // for which output. Display, not Debug: tempfile's own error names
+        // its path with Debug, which a build with `-Zfmt-debug=none` (the
+        // WASI toolchains') prints as nothing, so `-o nodir/x.wasm` with no
+        // `nodir` said "No such file or directory (os error 44) at path ".
         let temp_dir = match self.component.output.parent() {
             Some(parent) => tempfile::TempDir::new_in(parent).with_context(|| {
                 let dir = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
                 format!(
-                    "failed to create a temporary directory in {dir:?}, the directory of the output {:?}",
-                    self.component.output
+                    "failed to create a temporary directory in \"{}\", the directory of the output \"{}\"",
+                    dir.display(),
+                    self.component.output.display()
                 )
             })?,
             None => tempfile::TempDir::new().context("failed to create a temporary directory")?,
@@ -1484,10 +1487,16 @@ mod usage_error_tests {
         assert_eq!(usage.exit_code(), 2);
         assert!(usage.use_stderr());
         let rendered = usage.rendered();
-        assert!(rendered.starts_with("error: unexpected argument '--bogus-flag' found"), "{rendered}");
+        assert!(
+            rendered.starts_with("error: unexpected argument '--bogus-flag' found"),
+            "{rendered}"
+        );
         assert!(rendered.contains("Usage: wasm-component-ld"), "{rendered}");
         let shown = err.to_string();
-        assert!(shown.starts_with("unexpected argument '--bogus-flag' found"), "{shown}");
+        assert!(
+            shown.starts_with("unexpected argument '--bogus-flag' found"),
+            "{shown}"
+        );
         assert!(!shown.ends_with('\n'), "{shown:?}");
     }
 
@@ -1499,11 +1508,19 @@ mod usage_error_tests {
         let usage = err.downcast_ref::<UsageError>().expect("a UsageError");
         assert_eq!(usage.exit_code(), 0);
         assert!(!usage.use_stderr());
-        assert!(usage.rendered().contains("forwarded to `wasm-ld`"), "{}", usage.rendered());
+        assert!(
+            usage.rendered().contains("forwarded to `wasm-ld`"),
+            "{}",
+            usage.rendered()
+        );
         let err = link(&["wasm-component-ld", "--version"]).unwrap_err();
         let usage = err.downcast_ref::<UsageError>().expect("a UsageError");
         assert_eq!(usage.exit_code(), 0);
-        assert!(usage.rendered().starts_with("wasm-component-ld "), "{}", usage.rendered());
+        assert!(
+            usage.rendered().starts_with("wasm-component-ld "),
+            "{}",
+            usage.rendered()
+        );
     }
 
     /// An output in a directory that does not exist names the directory
@@ -1514,13 +1531,21 @@ mod usage_error_tests {
         let out = dir.join("missing").join("x.wasm");
         let err = run_from_args_with_lld_warnings(
             ["wasm-component-ld", "x.o", "-o", out.to_str().unwrap()].map(OsString::from),
-            |_| -> anyhow::Result<LldStatus> { panic!("no temporary directory: wasm-ld must not run") },
+            |_| -> anyhow::Result<LldStatus> {
+                panic!("no temporary directory: wasm-ld must not run")
+            },
         )
         .unwrap_err();
         let shown = err.to_string();
-        assert!(shown.contains("failed to create a temporary directory in"), "{shown}");
-        assert!(shown.contains(&format!("{:?}", dir.join("missing"))), "{shown}");
-        assert!(shown.contains(&format!("{out:?}")), "{shown}");
+        assert!(
+            shown.contains("failed to create a temporary directory in"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(&format!("\"{}\"", dir.join("missing").display())),
+            "{shown}"
+        );
+        assert!(shown.contains(&format!("\"{}\"", out.display())), "{shown}");
         assert!(err.downcast_ref::<UsageError>().is_none());
     }
 }
