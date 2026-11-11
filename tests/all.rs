@@ -870,7 +870,10 @@ fn main() {
             err.contains("is refused: the setting was renamed to DEVENV_WASM_COMPONENT_LD_VALIDATE in 1.99.1-b6"),
             "{err}"
         );
-        assert!(err.contains("Details: cargo help devenv renamed-setting"), "{err}");
+        assert!(
+            err.contains("Details: cargo help devenv renamed-setting"),
+            "{err}"
+        );
     }
     let bytes = link_with_env(
         &project,
