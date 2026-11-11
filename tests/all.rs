@@ -601,6 +601,93 @@ world imports {
     );
 }
 
+/// A user crate's own devenv:subprocess@0.4.6 section (devenv's guest crate,
+/// no `-in-libstd` suffix).
+const USER_DEVENV_SUBPROCESS_046_SECTION: &str = "component-type:wit-bindgen:0.58.0:devenv:subprocess@0.4.6:imports-with-all-of-its-exports-removed:encoded world";
+
+/// devenv:subprocess@0.4.6's `imports` world with `hint` returning `result`,
+/// as a component-type payload.
+fn devenv_subprocess_046_payload(result: &str) -> Vec<u8> {
+    component_type_payload(
+        &format!(
+            r#"
+package devenv:subprocess@0.4.6;
+
+interface concurrency {{
+  hint: func() -> {result};
+}}
+
+world imports {{
+  import concurrency;
+}}
+"#
+        ),
+        "imports",
+    )
+}
+
+/// `program` with one more component-type section, `section` holding
+/// `payload`.
+fn add_component_type_section(program: &str, section: &str, payload: &[u8]) -> String {
+    let bytes = payload
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{program}\n#[link_section = \"{section}\"]\n#[used]\nstatic COMPONENT_TYPE_USER: [u8; {}] = [{bytes}];\n",
+        payload.len()
+    )
+}
+
+// fork: with no devenv WIT on `--component-type`, std's devenv-subprocess
+// section is kept (above), so it now sits beside a user crate's own
+// devenv:subprocess@0.4.6 section, where through rust-1.99-b6's usage-error
+// rev std's was dropped. The two describe the same package version; when
+// their contents agree the worlds merge and the program links.
+#[test]
+fn keeps_std_and_a_users_devenv_subprocess_046_sections_together() {
+    let program = add_component_type_section(
+        &program_binding_devenv_subprocess(STD_DEVENV_SUBPROCESS_SECTION, "0.4.6"),
+        USER_DEVENV_SUBPROCESS_046_SECTION,
+        &devenv_subprocess_046_payload("u32"),
+    );
+    let output = compile(&[], &program);
+    assert_component(&output);
+    let imports = component_import_names(&output);
+    assert!(
+        imports
+            .iter()
+            .any(|name| name == "devenv:subprocess/concurrency@0.4.6"),
+        "imports: {imports:?}"
+    );
+}
+
+// fork: the same pair with differing contents for the one package version
+// fails the merge, as it does upstream (which keeps every section). Both
+// copies of devenv:subprocess@0.4.6 come from one WIT in practice (std's
+// library/devenv-subprocess-guest and devenv's guest crate), so this needs
+// a package published twice under one version.
+#[test]
+fn differing_std_and_user_devenv_subprocess_046_sections_fail_the_merge() {
+    let program = add_component_type_section(
+        &program_binding_devenv_subprocess(STD_DEVENV_SUBPROCESS_SECTION, "0.4.6"),
+        USER_DEVENV_SUBPROCESS_046_SECTION,
+        &devenv_subprocess_046_payload("u64"),
+    );
+    let err = format!(
+        "{:?}",
+        Project::new()
+            .try_compile(&[], &program, false)
+            .unwrap_err()
+    );
+    assert!(
+        err.contains("failed to merge package `devenv:subprocess@0.4.6` into existing copy"),
+        "{err}"
+    );
+    assert!(err.contains("mismatch in function `hint`"), "{err}");
+}
+
 /// `program` (from [`program_binding_devenv_subprocess`]) with its section's
 /// bytes replaced by `payload`.
 fn swap_component_type_payload(program: &str, payload: &[u8]) -> String {

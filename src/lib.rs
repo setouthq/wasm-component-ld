@@ -1367,6 +1367,14 @@ fn push_u32_leb(dst: &mut Vec<u8>, mut value: u32) {
 /// `devenv:unix-sockets/sockets@0.3.0::[resource-drop]socket`". Upstream
 /// keeps every section.
 ///
+/// A section kept that way sits beside any user crate's own
+/// `devenv:subprocess@0.4.6` section (devenv's guest crate), and the two
+/// worlds merge as wit-component merges any two: identical contents (one
+/// WIT, as std's guest and devenv's crate share) link, and differing
+/// contents for the one package version fail the merge, as upstream fails
+/// it (tests/all.rs, `..._046_sections_...`). With the devenv WIT on
+/// `--component-type` std's copy goes and only the user's merges with it.
+///
 /// Every other component-type section is kept. A user's own bindings (a
 /// wasi:http client crate such as wasip2, wasip3, wasi or wstd, a crate
 /// that binds `devenv:subprocess` itself at any version, or the user's own
