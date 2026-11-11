@@ -1801,7 +1801,10 @@ mod tests {
         // devenv:subprocess@0.4.6 alone (a WIT file with only that package's
         // world) is enough to drop it, as the session's does.
         let packages = BTreeSet::from(["devenv:subprocess@0.4.6".to_string()]);
-        assert_eq!(kept_after_strip_with(&std_sections, &packages), [STD_P2_IMPORTS]);
+        assert_eq!(
+            kept_after_strip_with(&std_sections, &packages),
+            [STD_P2_IMPORTS]
+        );
     }
 
     #[test]

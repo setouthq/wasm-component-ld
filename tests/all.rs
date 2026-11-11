@@ -534,7 +534,9 @@ fn keeps_std_devenv_subprocess_section_without_the_devenv_wit() {
     assert_component(&output);
     let imports = component_import_names(&output);
     assert!(
-        imports.iter().any(|name| name == "devenv:subprocess/concurrency@0.4.6"),
+        imports
+            .iter()
+            .any(|name| name == "devenv:subprocess/concurrency@0.4.6"),
         "imports: {imports:?}"
     );
 }
@@ -592,7 +594,9 @@ world imports {
     assert_component(&output);
     let imports = component_import_names(&output);
     assert!(
-        imports.iter().any(|name| name == "devenv:subprocess/concurrency@0.4.6"),
+        imports
+            .iter()
+            .any(|name| name == "devenv:subprocess/concurrency@0.4.6"),
         "imports: {imports:?}"
     );
 }
