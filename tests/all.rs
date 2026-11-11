@@ -514,25 +514,105 @@ fn keeps_a_users_devenv_subprocess_section_at_any_version() {
     }
 }
 
-// fork: std's own copy (library/devenv-subprocess-guest, rustc-dep-of-std)
-// ends its section name in "-in-libstd" and is still dropped.
+/// std's own copy of the devenv-subprocess section name
+/// (library/devenv-subprocess-guest built with rustc-dep-of-std).
+const STD_DEVENV_SUBPROCESS_SECTION: &str = "component-type:wit-bindgen:0.58.0:devenv:subprocess@0.4.6:imports-with-all-of-its-exports-removed:encoded worldrust-devenv-subprocess-guest-0.4.6-in-libstd";
+
+// fork: with no devenv WIT on `--component-type` (this linker run by hand,
+// by a native rustc's `-C linker=`, or by the c multicall's clang over a
+// Rust staticlib), std's devenv-subprocess section is the only type
+// information for std's devenv imports, so it is kept and the program
+// links. Through rust-1.99-b6's usage-error rev (adbce7efd666) it was
+// dropped here too: a devenv wasm32-wasip3 std program failed with "failed
+// to resolve import `devenv:unix-sockets/sockets@0.3.0::[resource-drop]socket`".
 #[test]
-fn strips_std_devenv_subprocess_section() {
-    let result = Project::new().try_compile(
+fn keeps_std_devenv_subprocess_section_without_the_devenv_wit() {
+    let output = compile(
         &[],
-        &program_binding_devenv_subprocess(
-            "component-type:wit-bindgen:0.58.0:devenv:subprocess@0.4.6:imports-with-all-of-its-exports-removed:encoded worldrust-devenv-subprocess-guest-0.4.6-in-libstd",
-            "0.4.6",
-        ),
-        false,
+        &program_binding_devenv_subprocess(STD_DEVENV_SUBPROCESS_SECTION, "0.4.6"),
     );
-    let err = format!("{:?}", result.unwrap_err());
+    assert_component(&output);
+    let imports = component_import_names(&output);
     assert!(
-        err.contains(
-            "module requires an import interface named `devenv:subprocess/concurrency@0.4.6`"
-        ),
-        "{err}"
+        imports.iter().any(|name| name == "devenv:subprocess/concurrency@0.4.6"),
+        "imports: {imports:?}"
     );
+}
+
+// fork: a session passes the devenv WIT as `--component-type`
+// (WASM_COMPONENT_TYPE_WIT_PATHS, rustc on WASI), and then std's copy is
+// dropped and the WIT gives the types. Here std's section describes `hint`
+// with another result type than the WIT and the program, so the link only
+// succeeds if the section is gone.
+#[test]
+fn strips_std_devenv_subprocess_section_when_the_devenv_wit_is_given() {
+    let project = Project::new();
+    project.file(
+        "subprocess.wit",
+        r#"
+package devenv:subprocess@0.4.6;
+
+interface concurrency {
+  hint: func() -> u32;
+}
+
+world imports {
+  import concurrency;
+}
+"#,
+    );
+    let program = program_binding_devenv_subprocess(STD_DEVENV_SUBPROCESS_SECTION, "0.4.6");
+    let stale = component_type_payload(
+        r#"
+package devenv:subprocess@0.4.6;
+
+interface concurrency {
+  hint: func() -> u64;
+}
+
+world imports {
+  import concurrency;
+}
+"#,
+        "imports",
+    );
+    let stale_program = swap_component_type_payload(&program, &stale);
+
+    // The stale section alone does not type the program's import.
+    let err = format!(
+        "{:?}",
+        project.try_compile(&[], &stale_program, false).unwrap_err()
+    );
+    assert!(err.contains("devenv:subprocess/concurrency@0.4.6"), "{err}");
+
+    let output = project.compile(
+        &["-Clink-arg=--component-type", "-Clink-arg=subprocess.wit"],
+        &stale_program,
+    );
+    assert_component(&output);
+    let imports = component_import_names(&output);
+    assert!(
+        imports.iter().any(|name| name == "devenv:subprocess/concurrency@0.4.6"),
+        "imports: {imports:?}"
+    );
+}
+
+/// `program` (from [`program_binding_devenv_subprocess`]) with its section's
+/// bytes replaced by `payload`.
+fn swap_component_type_payload(program: &str, payload: &[u8]) -> String {
+    let start = program.find("static COMPONENT_TYPE: [u8; ").unwrap();
+    let end = start + program[start..].find("];\n").unwrap() + 3;
+    let bytes = payload
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{}static COMPONENT_TYPE: [u8; {}] = [{bytes}];\n{}",
+        &program[..start],
+        payload.len(),
+        &program[end..]
+    )
 }
 
 /// fork: links `src` (wasm32-wasip1, through this linker) to `out.wasm` in

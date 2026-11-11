@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, CommandFactory, FromArgMatches};
 use clap_lex::OsStrExt;
 use lexopt::Arg;
+use std::collections::BTreeSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -10,7 +11,7 @@ use std::process::{Command, ExitStatus};
 use std::str::FromStr;
 use wasmparser::Payload;
 use wit_component::StringEncoding;
-use wit_parser::{Resolve, WorldId};
+use wit_parser::{Resolve, WorldId, WorldItem};
 
 mod argfile;
 mod p3_adapter;
@@ -932,6 +933,10 @@ impl App {
             }
         }
 
+        // fork: the packages the `--component-type` worlds import from, for
+        // the section strip below (std's devenv-subprocess section goes only
+        // when one of these gives its types).
+        let mut component_type_packages = BTreeSet::new();
         if !self.component.component_types.is_empty() {
             let mut merged = None::<(Resolve, WorldId)>;
             for wit_file in &self.component.component_types {
@@ -957,6 +962,7 @@ impl App {
                 unreachable!()
             };
 
+            component_type_packages = imported_packages(&resolve, world);
             wit_component::embed_component_metadata(
                 &mut core_module,
                 &resolve,
@@ -966,7 +972,7 @@ impl App {
             )?;
         }
 
-        strip_incompatible_component_type_sections(&mut core_module)?;
+        strip_incompatible_component_type_sections(&mut core_module, &component_type_packages)?;
 
         let mut encoder = wit_component::ComponentEncoder::default();
         encoder
@@ -1157,7 +1163,24 @@ fn module_export_names(module: &[u8]) -> Vec<String> {
     names
 }
 
-fn strip_incompatible_component_type_sections(module: &mut Vec<u8>) -> Result<()> {
+/// fork: every package (`namespace:name@version`) an interface `world`
+/// imports belongs to, the `--component-type` worlds' types.
+fn imported_packages(resolve: &Resolve, world: WorldId) -> BTreeSet<String> {
+    resolve.worlds[world]
+        .imports
+        .values()
+        .filter_map(|item| match item {
+            WorldItem::Interface { id, .. } => resolve.interfaces[*id].package,
+            _ => None,
+        })
+        .map(|package| resolve.packages[package].name.to_string())
+        .collect()
+}
+
+fn strip_incompatible_component_type_sections(
+    module: &mut Vec<u8>,
+    component_type_packages: &BTreeSet<String>,
+) -> Result<()> {
     if module.len() < 8 || &module[..4] != b"\0asm" {
         return Ok(());
     }
@@ -1181,7 +1204,7 @@ fn strip_incompatible_component_type_sections(module: &mut Vec<u8>) -> Result<()
 
         let strip = id == 0
             && custom_section_name(&module[pos..payload_end])
-                .map(is_incompatible_component_type_section)
+                .map(|name| is_incompatible_component_type_section(name, component_type_packages))
                 .unwrap_or(false);
 
         if !strip {
@@ -1326,9 +1349,23 @@ fn push_u32_leb(dst: &mut Vec<u8>, mut value: u32) {
 /// names in `-in-libstd`: wasip2 and wasip3, and the fork std's
 /// devenv-subprocess guest (`rust-devenv-subprocess-guest-<version>-in-libstd`
 /// since rust 1.99.1-b1). Those worlds describe what std may import, not
-/// what this program does: the program's actual imports get their types
-/// from std's `wasi:cli` imports world (kept) and from `--component-type`
-/// (the devenv WIT a session names in `WASM_COMPONENT_TYPE_WIT_PATHS`).
+/// what this program does: the program's wasi imports get their types from
+/// std's `wasi:cli` imports world (kept), so wasip2's and wasip3's
+/// export-less worlds always go.
+///
+/// std's devenv-subprocess section goes only when a `--component-type`
+/// world imports from its package at its version (`component_type_packages`,
+/// `devenv:subprocess@0.4.6`): in a session that is the devenv WIT
+/// `WASM_COMPONENT_TYPE_WIT_PATHS` names, which rustc on WASI passes as
+/// `--component-type`. With no such world (a link without that WIT: this
+/// linker run by hand, by a native rustc's `-C linker=`, or by the c
+/// multicall's clang driver over a Rust staticlib) the section is kept,
+/// since it is then the only type information for std's devenv imports
+/// (`devenv:subprocess/...`, `devenv:unix-sockets/sockets@0.3.0`'s
+/// `[resource-drop]socket`); through rust-1.99-b6's usage-error rev it was
+/// dropped there too, and such a link failed with "failed to resolve import
+/// `devenv:unix-sockets/sockets@0.3.0::[resource-drop]socket`". Upstream
+/// keeps every section.
 ///
 /// Every other component-type section is kept. A user's own bindings (a
 /// wasi:http client crate such as wasip2, wasip3, wasi or wstd, a crate
@@ -1338,7 +1375,10 @@ fn push_u32_leb(dst: &mut Vec<u8>, mut value: u32) {
 /// interface named `wasi:http/types@...`". Through rust-1.99-b6 this also
 /// dropped every bare `devenv:subprocess` imports world, the name std's
 /// guest then had, so such a crate lost its types whatever its version.
-fn is_incompatible_component_type_section(name: &str) -> bool {
+fn is_incompatible_component_type_section(
+    name: &str,
+    component_type_packages: &BTreeSet<String>,
+) -> bool {
     let Some(rest) = name.strip_prefix("component-type:wit-bindgen:") else {
         return false;
     };
@@ -1346,7 +1386,20 @@ fn is_incompatible_component_type_section(name: &str) -> bool {
         return false;
     };
     let exportless = world.contains("-with-all-of-its-exports-removed:encoded world");
-    exportless && world.ends_with("-in-libstd")
+    if !(exportless && world.ends_with("-in-libstd")) {
+        return false;
+    }
+    if !world.contains(":encoded worldrust-devenv-subprocess-guest-") {
+        return true;
+    }
+    // `devenv:subprocess@0.4.6:imports-with-all-...`: the package is the
+    // world's name up to its second `:`.
+    let mut parts = world.splitn(3, ':');
+    let package = match (parts.next(), parts.next()) {
+        (Some(namespace), Some(name)) => format!("{namespace}:{name}"),
+        _ => return false,
+    };
+    component_type_packages.contains(&package)
 }
 
 fn read_u32_leb(bytes: &[u8], mut pos: usize) -> Result<(u32, usize)> {
@@ -1552,7 +1605,11 @@ mod usage_error_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{component_type_path_and_world, strip_incompatible_component_type_sections};
+    use super::{
+        component_type_path_and_world, imported_packages,
+        strip_incompatible_component_type_sections,
+    };
+    use std::collections::BTreeSet;
 
     #[test]
     fn parses_component_type_world_suffix() {
@@ -1590,13 +1647,36 @@ mod tests {
     const USER_DEVENV_SUBPROCESS_044: &str = "component-type:wit-bindgen:0.58.0:devenv:subprocess@0.4.4:imports-with-all-of-its-exports-removed:encoded world";
     const USER_DEVENV_SUBPROCESS_046: &str = "component-type:wit-bindgen:0.58.0:devenv:subprocess@0.4.6:imports-with-all-of-its-exports-removed:encoded world";
 
+    /// What a session's `--component-type` gives (the devenv WIT
+    /// `WASM_COMPONENT_TYPE_WIT_PATHS` names): devenv:subprocess at std's
+    /// version, and the packages its world imports through `use`.
+    fn session() -> BTreeSet<String> {
+        [
+            "devenv:subprocess@0.4.6",
+            "devenv:unix-sockets@0.3.0",
+            "wasi:clocks@0.3.0",
+            "wasi:filesystem@0.3.0",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+
+    fn no_component_type() -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
     fn kept_after_strip(names: &[&str]) -> Vec<String> {
+        kept_after_strip_with(names, &session())
+    }
+
+    fn kept_after_strip_with(names: &[&str], packages: &BTreeSet<String>) -> Vec<String> {
         let sections = names
             .iter()
             .map(|name| (*name, name.as_bytes()))
             .collect::<Vec<_>>();
         let mut module = wasm_with_custom_sections(&sections);
-        strip_incompatible_component_type_sections(&mut module).unwrap();
+        strip_incompatible_component_type_sections(&mut module, packages).unwrap();
         custom_section_names(&module)
     }
 
@@ -1684,10 +1764,80 @@ mod tests {
         );
     }
 
+    // A link with no devenv WIT on `--component-type` (this linker run by
+    // hand or by a native rustc's `-C linker=`, the c multicall's clang over
+    // a Rust staticlib): std's devenv-subprocess section is then the only
+    // type information for std's devenv imports, so it stays; wasip2's and
+    // wasip3's export-less worlds still go (std's imports world types those).
+    #[test]
+    fn keeps_std_devenv_subprocess_section_without_its_package_on_component_type() {
+        let std_sections = [
+            STD_P2_PROXY,
+            STD_P2_COMMAND,
+            STD_P3_SERVICE,
+            STD_P3_COMMAND,
+            STD_DEVENV_SUBPROCESS,
+            STD_P2_IMPORTS,
+        ];
+        assert_eq!(
+            kept_after_strip_with(&std_sections, &no_component_type()),
+            [STD_DEVENV_SUBPROCESS, STD_P2_IMPORTS]
+        );
+        // Another package, or devenv:subprocess at another version, does not
+        // type std's 0.4.6 imports either.
+        for other in [
+            "my:app@1.0.0",
+            "devenv:subprocess@0.4.4",
+            "devenv:subprocess@0.5.0",
+            "devenv:subprocess",
+        ] {
+            let packages = BTreeSet::from([other.to_string()]);
+            assert_eq!(
+                kept_after_strip_with(&std_sections, &packages),
+                [STD_DEVENV_SUBPROCESS, STD_P2_IMPORTS],
+                "{other}"
+            );
+        }
+        // devenv:subprocess@0.4.6 alone (a WIT file with only that package's
+        // world) is enough to drop it, as the session's does.
+        let packages = BTreeSet::from(["devenv:subprocess@0.4.6".to_string()]);
+        assert_eq!(kept_after_strip_with(&std_sections, &packages), [STD_P2_IMPORTS]);
+    }
+
+    #[test]
+    fn imported_packages_name_each_imported_interfaces_package() {
+        let mut resolve = wit_parser::Resolve::default();
+        resolve
+            .push_str(
+                "sockets.wit",
+                "package devenv:unix-sockets@0.3.0;\ninterface sockets { resource socket; }\n",
+            )
+            .unwrap();
+        let package = resolve
+            .push_str(
+                "subprocess.wit",
+                r#"
+                package devenv:subprocess@0.4.6;
+                interface types { use devenv:unix-sockets/sockets@0.3.0.{socket}; }
+                interface concurrency { hint: func() -> u32; }
+                world imports { import types; import concurrency; import f: func(); }
+                "#,
+            )
+            .unwrap();
+        let world = resolve.select_world(&[package], Some("imports")).unwrap();
+        assert_eq!(
+            imported_packages(&resolve, world),
+            BTreeSet::from([
+                "devenv:subprocess@0.4.6".to_string(),
+                "devenv:unix-sockets@0.3.0".to_string()
+            ])
+        );
+    }
+
     #[test]
     fn leaves_non_wasm_inputs_alone() {
         let mut bytes = b"not wasm".to_vec();
-        strip_incompatible_component_type_sections(&mut bytes).unwrap();
+        strip_incompatible_component_type_sections(&mut bytes, &no_component_type()).unwrap();
         assert_eq!(bytes, b"not wasm");
     }
 
@@ -1748,7 +1898,7 @@ mod tests {
         );
 
         let mut fixed = module.clone();
-        strip_incompatible_component_type_sections(&mut fixed).unwrap();
+        strip_incompatible_component_type_sections(&mut fixed, &no_component_type()).unwrap();
         assert_eq!(custom_section_names(&fixed), [USER_WASI_014_PROXY]);
         componentize(&fixed).unwrap();
     }
@@ -1764,7 +1914,7 @@ mod tests {
         assert!(componentize(&module).is_err());
 
         let mut fixed = module.clone();
-        strip_incompatible_component_type_sections(&mut fixed).unwrap();
+        strip_incompatible_component_type_sections(&mut fixed, &no_component_type()).unwrap();
         assert_eq!(
             custom_section_names(&fixed),
             [
@@ -1799,7 +1949,7 @@ mod tests {
             ],
         );
         let mut same = module.clone();
-        strip_incompatible_component_type_sections(&mut same).unwrap();
+        strip_incompatible_component_type_sections(&mut same, &no_component_type()).unwrap();
         assert_eq!(same, module);
     }
 
