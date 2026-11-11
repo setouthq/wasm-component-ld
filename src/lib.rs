@@ -247,10 +247,13 @@ const LLD_FLAGS: &[LldFlag] = &[
 struct App {
     component: ComponentLdArgs,
     lld_args: Vec<OsString>,
-    /// fork: `SETOUT_WASM_COMPONENT_LD_VALIDATE` as it was when the
+    /// fork: `DEVENV_WASM_COMPONENT_LD_VALIDATE` as it was when the
     /// arguments were parsed (see `validate::enabled`). Read once, with the
     /// arguments, so that a test can set it without the process environment.
     validate_env: Option<OsString>,
+    /// fork: its 1.99.1-b5 name, `SETOUT_WASM_COMPONENT_LD_VALIDATE`, read
+    /// the same way only to refuse it (`validate::refuse_renamed`).
+    renamed_validate_env: Option<OsString>,
 }
 
 /// An invocation of the inner LLD linker that `wasm-component-ld` normally
@@ -368,7 +371,7 @@ struct ComponentLdArgs {
     /// Whether or not the output component is validated.
     ///
     /// This defaults to `true` (fork: upstream defaults to `false`). Without
-    /// this flag, `SETOUT_WASM_COMPONENT_LD_VALIDATE=0` in the environment
+    /// this flag, `DEVENV_WASM_COMPONENT_LD_VALIDATE=0` in the environment
     /// turns validation off.
     #[clap(long, require_equals = true, value_name = "true|false")]
     validate_component: Option<Option<bool>>,
@@ -800,6 +803,7 @@ impl App {
                 component: ComponentLdArgs::from_arg_matches(&matches)?,
                 lld_args,
                 validate_env: env::var_os(validate::ENV),
+                renamed_validate_env: env::var_os(validate::RENAMED_FROM),
             }),
             // fork: clap's error comes back ([`UsageError`]) instead of
             // exiting the process. The command with wasm-ld's options added
@@ -836,6 +840,9 @@ impl App {
     where
         F: for<'a> FnMut(&'a Lld, &'a tempfile::TempDir, &'a [&'a OsString]) -> Result<LldStatus>,
     {
+        // fork: the validation escape's old name fails the link before LLD
+        // runs (1.99.1-b6 renamed it).
+        validate::refuse_renamed(self.renamed_validate_env.as_deref())?;
         let mut lld = self.lld();
 
         // If a temporary output is needed make sure it has the same file name
@@ -2244,12 +2251,54 @@ fn p3_link_with_preview1_imports_returns_the_adapter_warning() -> Result<()> {
 }
 
 #[test]
+fn the_validation_escapes_old_name_fails_the_link_before_lld() -> Result<()> {
+    // fork: 1.99.1-b6 renamed SETOUT_WASM_COMPONENT_LD_VALIDATE to
+    // DEVENV_WASM_COMPONENT_LD_VALIDATE. The old name, whatever its value,
+    // is never an alias: the link fails before LLD runs, naming the exact
+    // new setting. The new name alone links as before.
+    let temp = tempfile::tempdir()?;
+    let output = temp.path().join("out.wasm");
+    let parse = || {
+        App::parse_from([
+            OsString::from("wasm-component-ld"),
+            OsString::from("--wasi-adapter=none"),
+            OsString::from("-o"),
+            output.as_os_str().to_owned(),
+            OsString::from("input.o"),
+        ])
+    };
+    for v in ["0", "1", ""] {
+        let mut app = parse()?;
+        app.renamed_validate_env = Some(OsString::from(v));
+        app.validate_env = Some(OsString::from("0"));
+        let mut ran = false;
+        let err = app
+            .run_with_lld(|_| {
+                ran = true;
+                Ok(LldStatus::from_code(0))
+            })
+            .unwrap_err();
+        assert!(!ran, "LLD ran under the old name ({v:?})");
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "SETOUT_WASM_COMPONENT_LD_VALIDATE={v} is refused: the setting was renamed \
+                 to DEVENV_WASM_COMPONENT_LD_VALIDATE in 1.99.1-b6, and no tool reads the \
+                 old name. Set DEVENV_WASM_COMPONENT_LD_VALIDATE={v} instead.\n\
+                 Details: cargo help devenv renamed-setting"
+            )
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn an_async_lowered_sync_import_fails_the_link() -> Result<()> {
     // fork: `g` is a sync WIT function, so lowering it with the `async`
     // option (an `[async-lower]g` import) makes a component no runtime
     // loads. wit-component encodes it anyway; the link must fail. The fake
     // LLD writes a ready core module where the real one would write its
-    // output. Each link says what SETOUT_WASM_COMPONENT_LD_VALIDATE is (unset
+    // output. Each link says what DEVENV_WASM_COMPONENT_LD_VALIDATE is (unset
     // for the default), so the ambient environment of `cargo test` does not
     // decide the outcome.
     let temp = tempfile::tempdir()?;
@@ -2302,7 +2351,7 @@ fn an_async_lowered_sync_import_fails_the_link() -> Result<()> {
         err.contains("in the lowering of `test:sync/api#g`"),
         "{err}"
     );
-    assert!(err.contains("SETOUT_WASM_COMPONENT_LD_VALIDATE=0"), "{err}");
+    assert!(err.contains("DEVENV_WASM_COMPONENT_LD_VALIDATE=0"), "{err}");
     assert!(!temp.path().join("out.wasm").exists());
 
     // `--validate-component=false` writes it, as upstream does by default,

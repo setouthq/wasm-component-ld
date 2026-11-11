@@ -10,8 +10,11 @@
 //! import or core module the failure belongs to.
 //!
 //! An explicit `--validate-component[=true|false]` decides. Without one,
-//! `SETOUT_WASM_COMPONENT_LD_VALIDATE=0` turns validation off; anything else,
-//! or no variable, keeps it on.
+//! `DEVENV_WASM_COMPONENT_LD_VALIDATE=0` turns validation off; anything else,
+//! or no variable, keeps it on. Through 1.99.1-b5 the variable was
+//! `SETOUT_WASM_COMPONENT_LD_VALIDATE`; 1.99.1-b6 renamed it (devenv's
+//! product name), and the old name now fails the link instead of being
+//! read or ignored.
 
 use anyhow::{Result, bail};
 use std::ffi::OsStr;
@@ -22,7 +25,31 @@ use wasmparser::{
 };
 
 /// The environment escape: `0` writes components without validating them.
-pub(crate) const ENV: &str = "SETOUT_WASM_COMPONENT_LD_VALIDATE";
+pub(crate) const ENV: &str = "DEVENV_WASM_COMPONENT_LD_VALIDATE";
+
+/// `ENV`'s name through 1.99.1-b5. Never an alias: set, it fails the link.
+pub(crate) const RENAMED_FROM: &str = "SETOUT_WASM_COMPONENT_LD_VALIDATE";
+
+/// The release that renamed `RENAMED_FROM` to `ENV`.
+pub(crate) const RENAMED_IN: &str = "1.99.1-b6";
+
+/// Fails the link when the old name is set, whatever its value, before LLD
+/// runs: the toolchain's settings carry devenv's name since 1.99.1-b6, and
+/// the error names the exact new setting, as cargo's refusal of every
+/// renamed setting does (`cargo help devenv renamed-setting`). A link
+/// outside cargo (clang's driver in the C tools, the linker run by hand)
+/// would otherwise drop the setting without a word.
+pub(crate) fn refuse_renamed(old: Option<&OsStr>) -> Result<()> {
+    let Some(v) = old else {
+        return Ok(());
+    };
+    let v = v.to_string_lossy();
+    bail!(
+        "{RENAMED_FROM}={v} is refused: the setting was renamed to {ENV} in \
+         {RENAMED_IN}, and no tool reads the old name. Set {ENV}={v} instead.\n\
+         Details: cargo help devenv renamed-setting"
+    )
+}
 
 /// Whether this link validates its output: the `--validate-component` flag
 /// when given (a bare flag means `true`), else on unless `ENV` is `0`.
