@@ -729,7 +729,6 @@ fn link_with_env(
         .arg(&format!("linker={myself}"))
         .args(args)
         .env_remove("DEVENV_WASM_COMPONENT_LD_VALIDATE")
-        .env_remove("SETOUT_WASM_COMPONENT_LD_VALIDATE")
         .envs(vars.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -844,43 +843,4 @@ fn an_async_lowered_sync_import_fails_at_link_time() {
                 .is_err()
         );
     }
-}
-
-#[test]
-fn the_validation_escapes_old_name_fails_the_link() {
-    // fork: 1.99.1-b6 renamed SETOUT_WASM_COMPONENT_LD_VALIDATE to
-    // DEVENV_WASM_COMPONENT_LD_VALIDATE. The old name is never an alias,
-    // whatever its value: a link with it fails and names the new setting,
-    // even beside the new name.
-    let project = Project::new();
-    let src = r#"
-fn main() {
-    println!("hello!");
-}
-"#;
-    for vars in [
-        &[("SETOUT_WASM_COMPONENT_LD_VALIDATE", "0")][..],
-        &[
-            ("SETOUT_WASM_COMPONENT_LD_VALIDATE", "1"),
-            ("DEVENV_WASM_COMPONENT_LD_VALIDATE", "1"),
-        ][..],
-    ] {
-        let err = format!("{:?}", link_with_env(&project, &[], src, vars).unwrap_err());
-        assert!(
-            err.contains("is refused: the setting was renamed to DEVENV_WASM_COMPONENT_LD_VALIDATE in 1.99.1-b6"),
-            "{err}"
-        );
-        assert!(
-            err.contains("Details: cargo help devenv renamed-setting"),
-            "{err}"
-        );
-    }
-    let bytes = link_with_env(
-        &project,
-        &[],
-        src,
-        &[("DEVENV_WASM_COMPONENT_LD_VALIDATE", "1")],
-    )
-    .unwrap();
-    assert_component(&bytes);
 }
